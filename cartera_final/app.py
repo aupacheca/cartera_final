@@ -2533,7 +2533,7 @@ def main() -> None:
 
                 # Paso 3: Filtro de operaciones según tipo
                 if tipo_registro == "Acciones/ETFs":
-                    op_options = [("buy", "Compra"), ("sell", "Venta"), ("dividend", "Dividendo"), ("split", "Split")]
+                    op_options = [("buy", "Compra"), ("sell", "Venta"), ("dividend", "Dividendo"), ("split", "Split"), ("brokerTransfer", "Transferencia entre brokers")]
                 elif tipo_registro == "Fondos":
                     op_options = [("buy", "Compra"), ("sell", "Venta"), ("traspaso_fondos", "Traspaso")]
                 else:
@@ -2640,6 +2640,71 @@ def main() -> None:
                                         st.rerun()
                                     except Exception as e:
                                         st.error(f"Error al guardar: {e}")
+                # --- Formulario específico: Transferencia entre brokers (solo Acciones/ETFs) ---
+                elif tipo_registro == "Acciones/ETFs" and op_type == "brokerTransfer":
+                    st.caption("Transfiere títulos de una cuenta (broker) a otra. El coste se arrastra, no hay tributo.")
+                    bt_pos_options = ["—— Elige posición ——"]
+                    if not catalog_activo.empty:
+                        for idx, (_, r) in enumerate(catalog_activo.iterrows()):
+                            lab = f"{r.get('ticker', '')} | {r.get('name', '')}"
+                            pt = str(r.get("positionType", "stock")).strip().lower()
+                            lab += " [ETF]" if pt == "etf" else " [Acción]"
+                            bt_pos_options.append(lab)
+                    bt_c1, bt_c2 = st.columns(2)
+                    with bt_c1:
+                        bt_posicion = st.selectbox("Posición a transferir", bt_pos_options, key="bt_posicion")
+                        bt_qty = st.text_input("Cantidad a transferir", placeholder="0 o 0,0000", key="bt_qty")
+                        bt_fecha = st.date_input("Fecha", key="bt_fecha")
+                        bt_broker_origen = st.selectbox("Broker origen", options=brokers_list, key="bt_broker_origen") if brokers_list else st.text_input("Broker origen", key="bt_broker_origen")
+                    with bt_c2:
+                        bt_broker_destino = st.selectbox("Broker destino", options=brokers_list, key="bt_broker_destino") if brokers_list else st.text_input("Broker destino", key="bt_broker_destino")
+                        bt_hora = st.time_input("Hora", value=dt_time(12, 0), key="bt_hora", step=60)
+                    if st.button("Guardar transferencia entre brokers", type="primary", key="guardar_bt"):
+                        if bt_posicion == "—— Elige posición ——":
+                            st.error("Elige la posición a transferir.")
+                        elif not bt_qty or _to_float(bt_qty, 0.0) <= 0:
+                            st.error("Indica la cantidad a transferir.")
+                        elif not bt_broker_origen or not str(bt_broker_origen).strip():
+                            st.error("Indica el broker origen.")
+                        elif not bt_broker_destino or not str(bt_broker_destino).strip():
+                            st.error("Indica el broker destino.")
+                        elif str(bt_broker_origen).strip() == str(bt_broker_destino).strip():
+                            st.error("El broker origen y destino deben ser diferentes.")
+                        else:
+                            idx_bt = bt_pos_options.index(bt_posicion) - 1
+                            if idx_bt < 0 or catalog_activo.empty or idx_bt >= len(catalog_activo):
+                                st.error("Posición no encontrada en el catálogo.")
+                            else:
+                                ro = catalog_activo.iloc[idx_bt]
+                                ticker_o = str(ro.get("ticker") or ro.get("ticker_Yahoo") or "")
+                                name_o = str(ro.get("name") or ticker_o)
+                                ticker_yahoo = str(ro.get("ticker_Yahoo") or ticker_o)
+                                pt = str(ro.get("positionType", "stock")).strip().lower()
+                                position_type = pt if pt in ("stock", "etf") else "stock"
+                                qty_val = _to_float(bt_qty, 0.0)
+                                date_str = bt_fecha.strftime("%Y-%m-%d") if hasattr(bt_fecha, "strftime") else str(bt_fecha)
+                                time_str = bt_hora.strftime("%H:%M:%S") if hasattr(bt_hora, "strftime") else "12:00:00"
+                                row_bt = {
+                                    "date": date_str, "time": time_str,
+                                    "ticker": ticker_o, "ticker_Yahoo": ticker_yahoo, "name": name_o,
+                                    "positionType": position_type, "positionCountry": ro.get("positionCountry", ""), "positionCurrency": ro.get("positionCurrency", "EUR"), "positionExchange": ro.get("positionExchange", ""),
+                                    "broker": str(bt_broker_origen).strip(),
+                                    "type": "brokerTransfer",
+                                    "positionNumber": qty_val, "price": 0,
+                                    "comission": 0, "comissionCurrency": "EUR", "destinationRetentionBaseCurrency": "", "taxes": 0, "taxesCurrency": "EUR",
+                                    "exchangeRate": 1.0, "positionQuantity": "", "autoFx": "No",
+                                    "switchBuyPosition": "", "switchBuyPositionType": "", "switchBuyPositionNumber": "", "switchBuyExchangeRate": "", "switchBuyBroker": "",
+                                    "spinOffBuyPosition": "", "spinOffBuyPositionNumber": "", "spinOffBuyPositionAllocation": "",
+                                    "brokerTransferNewBroker": str(bt_broker_destino).strip(),
+                                    "total": 0, "totalBaseCurrency": 0, "totalWithComission": 0, "totalWithComissionBaseCurrency": 0,
+                                }
+                                try:
+                                    append_operation(row_bt)
+                                    load_data.clear()
+                                    st.success("Transferencia entre brokers guardada.")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Error al guardar: {e}")
                 # --- Formulario específico: Permuta criptos (switch + switchBuy) ---
                 elif tipo_registro == "Criptos" and op_type == "switch":
                     st.caption("Genera dos movimientos: salida de la cripto origen y entrada en la cripto destino.")
