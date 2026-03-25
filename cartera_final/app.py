@@ -5,6 +5,7 @@ import math
 import os
 import re
 import sqlite3
+import urllib.request
 from datetime import datetime, time as dt_time
 from pathlib import Path
 from functools import lru_cache
@@ -28,9 +29,11 @@ _DB_FILENAME = os.environ.get("DB_FILENAME", "acciones.db")
 DB_PATH = str(_DATA_DIR / _DB_FILENAME)
 CSV_PATH = str(_DATA_DIR / "acciones.csv")
 FONDOS_CSV_PATH = str(_DATA_DIR / "fondos.csv")
+MOVIMIENTOS_CRIPTOS_CSV_PATH = str(_DATA_DIR / "movimientos_criptos.csv")
 DIVIDENDOS_CSV_PATH = str(_DATA_DIR / "dividendos.csv")
 COTIZACIONES_CACHE_PATH = str(_DATA_DIR / "cartera_cotizaciones_cache.pkl")
 COTIZACIONES_META_PATH = str(_DATA_DIR / "cartera_cotizaciones_meta.json")
+PRECIOS_MANUALES_PATH = str(_DATA_DIR / "precios_manuales.json")
 CSV_ENCODING = "latin-1"
 CSV_DECIMAL = ","
 CSV_SEP = ","
@@ -95,6 +98,15 @@ def _get_data_mount_source() -> str | None:
     except Exception:
         pass
     return None
+
+
+# Nombres legibles para criptos (normaliza cuando name == ticker_Yahoo, ej. ETH-EUR → Ethereum)
+CRYPTO_TICKER_NAMES = {
+    "BTC": "Bitcoin", "ETH": "Ethereum", "XRP": "Ripple", "SOL": "Solana",
+    "BNB": "Binance", "TRX": "Tron", "AVAX": "Avalanche", "HBAR": "Hedera",
+    "ADA": "Cardano", "DOT": "Polkadot", "LINK": "Chainlink", "MATIC": "Polygon",
+    "DOGE": "Dogecoin", "UNI": "Uniswap", "ATOM": "Cosmos", "LTC": "Litecoin",
+}
 
 
 def _get_db():
@@ -319,14 +331,15 @@ def _init_db_dividendos():
         conn.execute(f"CREATE TABLE IF NOT EXISTS dividendos ({cols_sql})")
 
 
+@st.cache_data
 def load_dividendos() -> pd.DataFrame:
     """Carga todos los dividendos desde la tabla dividendos (migra desde dividendos.csv si existe y tabla vacía)."""
     _init_db_dividendos()
     _migrate_dividendos_csv_to_db()
     with _get_db() as conn:
-        df = pd.read_sql("SELECT * FROM dividendos", conn)
+        df = pd.read_sql("SELECT rowid AS _rowid_, * FROM dividendos", conn)
     if df.empty:
-        return pd.DataFrame(columns=DIVIDENDOS_COLUMNS)
+        return pd.DataFrame(columns=["_rowid_"] + DIVIDENDOS_COLUMNS)
     if "date" in df.columns:
         df["date"] = df["date"].astype(str).str.split("T").str[0].str.strip()
     if "time" in df.columns:
@@ -335,6 +348,37 @@ def load_dividendos() -> pd.DataFrame:
     df["datetime_full"] = pd.to_datetime(dt_str, format="mixed", errors="coerce")
     df = df.sort_values("datetime_full", ascending=False).reset_index(drop=True)
     return df
+
+
+def update_dividendo(rowid: int, row_dict: dict) -> None:
+    """Actualiza un dividendo por rowid."""
+    _init_db_dividendos()
+    update_cols = [c for c in DIVIDENDOS_COLUMNS if c in row_dict]
+    if not update_cols:
+        return
+    sets = ", ".join(f'"{c}" = ?' for c in update_cols)
+    vals = [_row_to_db_val(row_dict.get(c, "")) for c in update_cols]
+    with _get_db() as conn:
+        conn.execute(f"UPDATE dividendos SET {sets} WHERE rowid = ?", vals + [rowid])
+        conn.commit()
+    if hasattr(load_dividendos, "clear"):
+        load_dividendos.clear()
+
+
+def delete_dividendos_by_rowids(rowids: list[int]) -> int:
+    """Elimina dividendos por sus rowids. Devuelve el número de filas eliminadas."""
+    if not rowids:
+        return 0
+    _init_db_dividendos()
+    with _get_db() as conn:
+        n = 0
+        for rid in rowids:
+            cur = conn.execute("DELETE FROM dividendos WHERE rowid = ?", (rid,))
+            n += cur.rowcount
+        conn.commit()
+    if hasattr(load_dividendos, "clear"):
+        load_dividendos.clear()
+    return n
 
 
 def append_dividendo(row: dict) -> None:
@@ -351,6 +395,54 @@ def append_dividendo(row: dict) -> None:
             vals,
         )
         conn.commit()
+
+
+def sync_dividendos_from_filios_csv(filios_path: str | Path | None = None) -> tuple[bool, str]:
+    """
+    Reemplaza la tabla dividendos con los datos de un CSV exportado desde Filios.
+    Si filios_path es None, usa dividendos_filios.csv en el directorio del proyecto.
+    Devuelve (éxito, mensaje).
+    """
+    path = Path(filios_path) if filios_path else Path(_DATA_DIR) / "dividendos_filios.csv"
+    if not path.exists():
+        return False, f"No existe el archivo: {path}"
+    try:
+        df = pd.read_csv(path, dtype=str, keep_default_na=False)
+    except Exception as e:
+        return False, f"Error leyendo CSV: {e}"
+    cols = [c for c in DIVIDENDOS_COLUMNS if c in df.columns]
+    if not cols:
+        return False, "El CSV no tiene las columnas esperadas de dividendos."
+    df = df[[c for c in DIVIDENDOS_COLUMNS if c in df.columns]].copy()
+    if "ticker_Yahoo" not in df.columns:
+        df["ticker_Yahoo"] = df.get("ticker", pd.Series([""] * len(df)))
+    if "nombre" not in df.columns:
+        df["nombre"] = df.get("ticker", pd.Series([""] * len(df)))
+    for c in DIVIDENDOS_COLUMNS:
+        if c not in df.columns:
+            df[c] = ""
+    for c in DIVIDENDOS_COLUMNS:
+        if c not in df.columns:
+            df[c] = ""
+    df = df[DIVIDENDOS_COLUMNS]
+    if "date" in df.columns:
+        df["date"] = df["date"].astype(str).str.strip().str.split("T").str[0].str.strip()
+    if "time" in df.columns:
+        df["time"] = df["time"].astype(str).str.strip().apply(_normalize_time_to_24h)
+    _init_db_dividendos()
+    placeholders = ", ".join("?" for _ in DIVIDENDOS_COLUMNS)
+    with _get_db() as conn:
+        conn.execute("DELETE FROM dividendos")
+        for _, row in df.iterrows():
+            vals = [_row_to_db_val(row.get(c, "")) for c in DIVIDENDOS_COLUMNS]
+            conn.execute(
+                f'INSERT INTO dividendos ({", ".join(DIVIDENDOS_COLUMNS)}) VALUES ({placeholders})',
+                vals,
+            )
+        conn.commit()
+    if hasattr(load_dividendos, "clear"):
+        load_dividendos.clear()
+    return True, f"Sincronizados {len(df)} dividendos desde {path.name}."
 
 
 def _migrate_dividendos_csv_to_db():
@@ -701,7 +793,19 @@ def compute_fifo_fondos(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
                     cost_hist += consumed * lote["Precio medio €"]
                     lote["Cantidad"] -= consumed
                     remaining = 0.0
-            plusvalia = float(total_eur) - cost_hist
+            # Valor de transmisión fiscal: totalBase - comisión - impuestos (normativa española)
+            total_base = _to_float(_safe_get(row, "totalBaseCurrency"), 0.0)
+            fx = _to_float(_safe_get(row, "exchangeRate"), 1.0) or 1.0
+            comm = _to_float(_safe_get(row, "comission"), 0.0)
+            tax = _to_float(_safe_get(row, "taxes"), 0.0)
+            comm_ccy = str(_safe_get(row, "comissionCurrency") or "").strip().upper()
+            tax_ccy = str(_safe_get(row, "taxesCurrency") or "").strip().upper()
+            comm_eur = comm if comm_ccy == "EUR" else (comm * fx if fx and abs(fx) > 1e-9 else comm)
+            tax_eur = tax if tax_ccy == "EUR" else (tax * fx if fx and abs(fx) > 1e-9 else tax)
+            valor_transmision = total_base - comm_eur - tax_eur
+
+            dest_ret = _to_float(_safe_get(row, "destinationRetentionBaseCurrency"), 0.0)
+            plusvalia = float(valor_transmision) - cost_hist
             sales_rows.append({
                 "Broker": broker,
                 "Ticker": ticker,
@@ -710,8 +814,9 @@ def compute_fifo_fondos(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
                 "Fecha venta": fecha,
                 "Cantidad vendida": float(qty),
                 "Valor compra histórico (€)": cost_hist,
-                "Valor venta (€)": float(total_eur),
+                "Valor venta (€)": float(valor_transmision),
                 "Plusvalía / Minusvalía (€)": plusvalia,
+                "Retención dest. (€)": dest_ret,
                 "Tipo activo": "fund",
             })
             continue
@@ -778,6 +883,144 @@ def get_ticker_catalog_criptos(df: pd.DataFrame) -> pd.DataFrame:
     return df_cat.drop_duplicates(subset=["ticker_Yahoo"], keep="first")[req].sort_values("ticker_Yahoo").reset_index(drop=True)
 
 
+def _init_instrument_catalog() -> None:
+    """Tabla ISIN y metadatos globales por ticker_Yahoo (clave única de cotización)."""
+    with _get_db() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS instrument_catalog (
+                ticker_Yahoo TEXT PRIMARY KEY,
+                isin TEXT
+            )
+            """
+        )
+        conn.commit()
+
+
+def get_universe_instruments_table() -> pd.DataFrame:
+    """
+    Instrumentos distintos por ticker_Yahoo en acciones, fondos y criptos, con ISIN desde instrument_catalog.
+    """
+    _init_instrument_catalog()
+    by_yahoo: dict[str, dict] = {}
+
+    def _feed(df: pd.DataFrame | None, label: str) -> None:
+        if df is None or df.empty:
+            return
+        cat = get_ticker_catalog_criptos(df) if label == "Criptos" else get_ticker_catalog(df)
+        if cat.empty:
+            return
+        for _, r in cat.iterrows():
+            y = str(r.get("ticker_Yahoo") or "").strip()
+            if not y:
+                continue
+            if y not in by_yahoo:
+                by_yahoo[y] = {"ticker": "", "name": "", "origenes": set()}
+            o = by_yahoo[y]
+            o["origenes"].add(label)
+            t = str(r.get("ticker") or "").strip()
+            n = str(r.get("name") or "").strip()
+            if t and not o["ticker"]:
+                o["ticker"] = t
+            if n and not o["name"]:
+                o["name"] = n
+
+    _feed(load_data(), "Acciones")
+    _feed(load_data_fondos(), "Fondos")
+    _feed(load_data_criptos(), "Criptos")
+
+    with _get_db() as conn:
+        cur = conn.execute("SELECT ticker_Yahoo, isin FROM instrument_catalog")
+        isin_map = {str(a or "").strip(): str(b or "").strip() for a, b in cur.fetchall()}
+
+    rows = []
+    for y in sorted(by_yahoo.keys()):
+        o = by_yahoo[y]
+        rows.append({
+            "ticker_Yahoo": y,
+            "ticker": o["ticker"],
+            "name": o["name"],
+            "ISIN": isin_map.get(y, ""),
+            "Origen": ", ".join(sorted(o["origenes"])),
+        })
+    return pd.DataFrame(rows)
+
+
+def apply_global_instrument_update(
+    old_yahoo: str,
+    new_yahoo: str,
+    ticker: str,
+    name: str,
+    isin: str,
+) -> tuple[bool, str]:
+    """
+    Actualiza ticker_Yahoo, ticker y name en movimientos, fondos, criptos y dividendos.
+    ISIN se guarda en instrument_catalog (por instrumento global). Si isin vacío, se elimina la fila del catálogo.
+    """
+    old_yahoo = (old_yahoo or "").strip()
+    new_yahoo = (new_yahoo or "").strip()
+    ticker = (ticker or "").strip()
+    name = (name or "").strip()
+    isin = (isin or "").strip()
+    if not old_yahoo:
+        return False, "Selecciona un instrumento válido."
+    if not new_yahoo:
+        return False, "Ticker Yahoo no puede estar vacío."
+
+    if new_yahoo != old_yahoo:
+        with _get_db() as conn:
+            for tbl in ("movimientos", "movimientos_fondos", "movimientos_criptos"):
+                try:
+                    n = conn.execute(
+                        f'SELECT COUNT(*) FROM "{tbl}" WHERE ticker_Yahoo = ?', (new_yahoo,)
+                    ).fetchone()[0]
+                    if n and n > 0:
+                        return (
+                            False,
+                            f"Ya hay movimientos con ticker_Yahoo «{new_yahoo}». Elige otro símbolo o unifica antes los datos.",
+                        )
+                except sqlite3.OperationalError:
+                    pass
+
+    with _get_db() as conn:
+        for tbl in ("movimientos", "movimientos_fondos", "movimientos_criptos"):
+            try:
+                conn.execute(
+                    f'UPDATE "{tbl}" SET ticker_Yahoo = ?, ticker = ?, name = ? WHERE ticker_Yahoo = ?',
+                    (new_yahoo, ticker, name, old_yahoo),
+                )
+            except sqlite3.OperationalError:
+                pass
+        try:
+            conn.execute(
+                "UPDATE dividendos SET ticker_Yahoo = ?, ticker = ?, nombre = ? WHERE ticker_Yahoo = ?",
+                (new_yahoo, ticker, name, old_yahoo),
+            )
+        except sqlite3.OperationalError:
+            pass
+
+        _init_instrument_catalog()
+        conn.execute(
+            "DELETE FROM instrument_catalog WHERE ticker_Yahoo IN (?, ?)",
+            (old_yahoo, new_yahoo),
+        )
+        if isin:
+            conn.execute(
+                "INSERT INTO instrument_catalog (ticker_Yahoo, isin) VALUES (?, ?)",
+                (new_yahoo, isin),
+            )
+        conn.commit()
+
+    load_data.clear()
+    load_data_fondos.clear()
+    if hasattr(load_data_criptos, "clear"):
+        load_data_criptos.clear()
+    if hasattr(load_dividendos, "clear"):
+        load_dividendos.clear()
+
+    return True, f"Actualizado «{old_yahoo}» → datos guardados."
+
+
 def _num_to_csv(val):
     """Formatea número para CSV con coma decimal."""
     if val is None or (isinstance(val, float) and pd.isna(val)):
@@ -798,7 +1041,6 @@ def _row_to_db_val(v):
 
 def append_operation(new_row: dict) -> None:
     """Añade una fila a la tabla movimientos (acciones/ETFs)."""
-    print(f"[Cartera] Guardando movimiento en: {DB_PATH}", flush=True)
     vals = [_row_to_db_val(new_row.get(c, "")) for c in MOVIMIENTOS_COLUMNS]
     placeholders = ", ".join("?" for _ in MOVIMIENTOS_COLUMNS)
     with _get_db() as conn:
@@ -844,23 +1086,37 @@ def append_operation_criptos(new_row: dict) -> None:
         conn.commit()
 
 
-def recalc_all_totals() -> tuple[int, str]:
+def _clear_form_nueva_operacion() -> None:
+    """Limpia solo totales/cantidades del formulario tras guardar (posición, fecha, broker se mantienen)."""
+    keys_to_clear = [
+        "op_qty_nuevo", "op_precio_nuevo", "op_total_nuevo",
+        "op_com_nuevo", "op_tax_nuevo", "op_dest_nuevo",
+        "tf_qty", "tf_valor_eur",
+        "bt_qty",
+        "perm_qty_origen", "perm_qty_destino", "perm_valor_eur",
+        "ctf_qty", "ctf_comision",
+    ]
+    for k in keys_to_clear:
+        if k in st.session_state:
+            del st.session_state[k]
+
+
+def recalc_all_totals(use_ecb_rates: bool = False) -> tuple[int, str]:
     """
     Recalcula total, totalBaseCurrency, totalWithComission, totalWithComissionBaseCurrency
     para TODOS los movimientos (acciones, fondos, criptos) usando _recalc_totals.
+    Si use_ecb_rates=True, actualiza exchangeRate con tipos del BCE (como Filios) antes de recalcular.
     Devuelve (filas actualizadas, mensaje).
     """
     updated = 0
 
     # Umbral: si el nuevo total difiere del anterior >100x o <0.01x, no actualizar
-    # (indica precio con formato decimal erróneo, ej. 25,475 guardado como 25475)
     RATIO_MAX = 100.0
     RATIO_MIN = 0.01
 
     def _recalc_table(conn: sqlite3.Connection, tabla: str) -> int:
-        cur = conn.execute(
-            f'SELECT rowid, type, positionNumber, price, comission, taxes, exchangeRate, positionCurrency, comissionCurrency, taxesCurrency, totalWithComissionBaseCurrency FROM "{tabla}"'
-        )
+        cols = "rowid, type, date, positionNumber, price, comission, taxes, exchangeRate, positionCurrency, comissionCurrency, taxesCurrency, totalWithComissionBaseCurrency"
+        cur = conn.execute(f'SELECT {cols} FROM "{tabla}"')
         rows = cur.fetchall()
         n = 0
         tipos_recalc = ("buy", "sell", "switch", "switchbuy")
@@ -868,12 +1124,26 @@ def recalc_all_totals() -> tuple[int, str]:
             tipo = str(r[1] or "").strip().lower()
             if tipo not in tipos_recalc:
                 continue
-            rowid, qty, price, comm, tax, fx = r[0], _to_float(r[2]), _to_float(r[3]), _to_float(r[4]), _to_float(r[5]), _to_float(r[6], 1.0)
-            pos_ccy = str(r[7] or "").strip() or "EUR"
-            comm_ccy = str(r[8] or "").strip()
-            tax_ccy = str(r[9] or "").strip()
-            old_twc = _to_float(r[10])
-            recalc = _recalc_totals(qty, price, comm, tax, fx, pos_ccy, comm_ccy, tax_ccy)
+            rowid = r[0]
+            op_date = str(r[2] or "").strip() if len(r) > 2 else ""
+            qty = _to_float(r[3])
+            price = _to_float(r[4])
+            comm = _to_float(r[5])
+            tax = _to_float(r[6])
+            fx = _to_float(r[7], 1.0)
+            pos_ccy = str(r[8] or "").strip() or "EUR"
+            comm_ccy = str(r[9] or "").strip()
+            tax_ccy = str(r[10] or "").strip()
+            old_twc = _to_float(r[11])
+
+            # Si use_ecb_rates y la operación está en divisa distinta de EUR, usar tipo BCE
+            if use_ecb_rates and pos_ccy and pos_ccy.upper() != "EUR" and op_date:
+                ecb_rate = get_fx_rate_ecb(pos_ccy, op_date)
+                if not math.isnan(ecb_rate) and ecb_rate > 0:
+                    fx = ecb_rate
+                    conn.execute(f'UPDATE "{tabla}" SET exchangeRate=? WHERE rowid=?', (fx, rowid))
+
+            recalc = _recalc_totals(qty, price, comm, tax, fx, pos_ccy, comm_ccy, tax_ccy, tipo=tipo)
             new_twc = recalc["totalWithComissionBaseCurrency"]
             if old_twc and abs(old_twc) > 1e-6:
                 ratio = new_twc / old_twc
@@ -1011,6 +1281,28 @@ def export_fondos_to_csv() -> bool:
                 out[col] = out[col].astype(str)
         out.to_csv(FONDOS_CSV_PATH, index=False, decimal=CSV_DECIMAL, sep=CSV_SEP, encoding=CSV_ENCODING)
         load_data_fondos.clear()
+        return True
+    except Exception:
+        return False
+
+
+def export_criptos_to_csv() -> bool:
+    """
+    Exporta los movimientos de cripto desde la base SQLite a movimientos_criptos.csv
+    (respaldo, formato coma decimal).
+    """
+    try:
+        _init_db_criptos()
+        df = load_data_criptos()
+        cols = [c for c in MOVIMIENTOS_CRIPTOS_COLUMNS if c in df.columns]
+        if not cols:
+            return False
+        out = df[cols].copy()
+        for col in ("date", "time"):
+            if col in out.columns:
+                out[col] = out[col].astype(str)
+        out.to_csv(MOVIMIENTOS_CRIPTOS_CSV_PATH, index=False, decimal=CSV_DECIMAL, sep=CSV_SEP, encoding=CSV_ENCODING)
+        load_data_criptos.clear()
         return True
     except Exception:
         return False
@@ -1161,6 +1453,22 @@ def load_data_criptos() -> pd.DataFrame:
             s = df[col].astype(str).str.strip().str.replace(",", ".", regex=False)
             df[col] = pd.to_numeric(s, errors="coerce")
 
+    # Normalizar name: si name == ticker_Yahoo (ej. ETH-EUR), usar nombre humano
+    if {"name", "ticker", "ticker_Yahoo"}.issubset(df.columns):
+        name_str = df["name"].astype(str).str.strip()
+        yahoo_str = df["ticker_Yahoo"].astype(str).str.strip()
+        mask = (name_str == yahoo_str) & (yahoo_str != "")
+        if mask.any():
+            def _norm_name(row):
+                t = str(row["ticker"]).strip().upper()
+                if "-" in t:
+                    t = t.split("-")[0]
+                if not t and str(row.get("ticker_Yahoo", "")).strip():
+                    t = str(row["ticker_Yahoo"]).strip().split("-")[0].upper()
+                return CRYPTO_TICKER_NAMES.get(t, t or str(row.get("ticker_Yahoo", "")).strip())
+
+            df.loc[mask, "name"] = df.loc[mask].apply(_norm_name, axis=1)
+
     return df
 
 
@@ -1201,20 +1509,28 @@ def _recalc_totals(
     pos_ccy: str,
     comm_ccy: str,
     tax_ccy: str,
+    tipo: str = "",
 ) -> dict[str, float]:
     """
-    Recalcula total, totalBaseCurrency, totalWithComission, totalWithComissionBaseCurrency
-    usando la misma lógica que para Amadeus y el resto de activos:
-    total = qty * price; totalBase = total * fx; totalWithComissionBaseCurrency = totalBase + comm_eur + tax_eur.
+    Recalcula total, totalBaseCurrency, totalWithComission, totalWithComissionBaseCurrency.
+    - Compras (buy, switchbuy): totalWithComission = totalBase + comisión + impuestos.
+    - Ventas (sell, switch): totalWithComission = totalBase - comisión - impuestos (lo que realmente recibes).
     """
     total_local = qty * price
     total_base = total_local * fx if fx and abs(fx) > 1e-9 else total_local
     comm_eur = comm if (comm_ccy or "").strip().upper() == "EUR" else comm * fx
     tax_eur = tax if (tax_ccy or "").strip().upper() == "EUR" else tax * fx
-    total_with_comm_base = total_base + comm_eur + tax_eur
-    comm_local = comm if (comm_ccy or "").strip().upper() == (pos_ccy or "").strip().upper() else (comm_eur / fx if fx and abs(fx) > 1e-9 else 0.0)
-    tax_local = tax if (tax_ccy or "").strip().upper() == (pos_ccy or "").strip().upper() else (tax_eur / fx if fx and abs(fx) > 1e-9 else 0.0)
-    total_with_comm_local = total_local + comm_local + tax_local
+    tipo_lower = str(tipo or "").strip().lower()
+    if tipo_lower in ("sell", "switch"):
+        total_with_comm_base = total_base - comm_eur - tax_eur
+        comm_local = comm if (comm_ccy or "").strip().upper() == (pos_ccy or "").strip().upper() else (comm_eur / fx if fx and abs(fx) > 1e-9 else 0.0)
+        tax_local = tax if (tax_ccy or "").strip().upper() == (pos_ccy or "").strip().upper() else (tax_eur / fx if fx and abs(fx) > 1e-9 else 0.0)
+        total_with_comm_local = total_local - comm_local - tax_local
+    else:
+        total_with_comm_base = total_base + comm_eur + tax_eur
+        comm_local = comm if (comm_ccy or "").strip().upper() == (pos_ccy or "").strip().upper() else (comm_eur / fx if fx and abs(fx) > 1e-9 else 0.0)
+        tax_local = tax if (tax_ccy or "").strip().upper() == (pos_ccy or "").strip().upper() else (tax_eur / fx if fx and abs(fx) > 1e-9 else 0.0)
+        total_with_comm_local = total_local + comm_local + tax_local
     return {
         "total": total_local,
         "totalBaseCurrency": total_base,
@@ -1428,6 +1744,137 @@ def compute_positions(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def compute_positions_fifo(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Posiciones con FIFO en ventas y traspasos (como Filios).
+    Usa lotes internamente: buy añade lote, sell consume FIFO, transfer mueve lotes FIFO.
+    Misma firma y formato de salida que compute_positions.
+    """
+    positions: dict[tuple[str, str], dict] = {}
+
+    def ensure(key: tuple[str, str], row: pd.Series):
+        if key not in positions:
+            positions[key] = {
+                "lots": [],
+                "ticker_orig": _safe_get(row, "ticker"),
+                "name": _safe_get(row, "name") or _safe_get(row, "ticker") or "",
+                "pos_currency": _safe_get(row, "positionCurrency", "EUR"),
+                "pos_type": _safe_get(row, "positionType", ""),
+            }
+
+    for _, row in df.iterrows():
+        broker = _safe_get(row, "broker")
+        ticker_y = _safe_get(row, "ticker_Yahoo") or _safe_get(row, "ticker")
+        if ticker_y is None or (isinstance(ticker_y, str) and not str(ticker_y).strip()):
+            continue
+        key_ticker = str(ticker_y).strip()
+        if broker is None or (isinstance(broker, str) and not str(broker).strip()):
+            if str(_safe_get(row, "type", "") or "").strip().lower() != "split":
+                continue
+        broker = str(broker or "").strip()
+
+        qty = _to_float(_safe_get(row, "positionNumber"), 0)
+        total_eur = _to_float(_safe_get(row, "totalWithComissionBaseCurrency"), 0)
+        price_local = _to_float(_safe_get(row, "price"), 0)
+        t = str(_safe_get(row, "type", "") or "").strip().lower()
+
+        if t == "split" and qty > 0:
+            factor = qty
+            keys = [(broker, key_ticker)] if broker else [k for k in positions if k[1] == key_ticker]
+            for k in keys:
+                if k in positions:
+                    for lot in positions[k]["lots"]:
+                        lot["qty"] *= factor
+            continue
+
+        if not broker or qty is None or qty <= 0:
+            if t not in ("buy", "switchbuy", "sell", "switch", "brokertransfer"):
+                continue
+
+        key = (broker, key_ticker)
+
+        if t == "brokertransfer":
+            dest_raw = _safe_get(row, "brokerTransferNewBroker")
+            if not dest_raw:
+                continue
+            dest_broker = str(dest_raw).strip()
+            src_key, dst_key = key, (dest_broker, key_ticker)
+            ensure(src_key, row)
+            ensure(dst_key, row)
+            src_lots = positions[src_key]["lots"]
+            remaining = qty
+            while remaining > MIN_POSITION and src_lots:
+                lot = src_lots[0]
+                lot_qty = lot["qty"]
+                if lot_qty <= remaining + MIN_POSITION:
+                    positions[dst_key]["lots"].append({"qty": lot_qty, "cost_eur": lot["cost_eur"], "cost_local": lot["cost_local"]})
+                    remaining -= lot_qty
+                    src_lots.pop(0)
+                else:
+                    frac = remaining / lot_qty
+                    positions[dst_key]["lots"].append({
+                        "qty": remaining,
+                        "cost_eur": lot["cost_eur"] * frac,
+                        "cost_local": lot["cost_local"] * frac,
+                    })
+                    lot["qty"] -= remaining
+                    lot["cost_eur"] -= lot["cost_eur"] * frac
+                    lot["cost_local"] -= lot["cost_local"] * frac
+                    remaining = 0
+            continue
+
+        if t in ("buy", "switchbuy"):
+            ensure(key, row)
+            cost_eur = total_eur if total_eur is not None else 0
+            cost_local = price_local * qty if price_local else 0
+            positions[key]["lots"].append({"qty": qty, "cost_eur": cost_eur, "cost_local": cost_local})
+            continue
+
+        if t in ("sell", "switch"):
+            ensure(key, row)
+            lots = positions[key]["lots"]
+            remaining = abs(qty)
+            while remaining > MIN_POSITION and lots:
+                lot = lots[0]
+                lot_qty = lot["qty"]
+                if lot_qty <= remaining + MIN_POSITION:
+                    remaining -= lot_qty
+                    lots.pop(0)
+                else:
+                    frac = remaining / lot_qty
+                    lot["qty"] -= remaining
+                    lot["cost_eur"] -= lot["cost_eur"] * frac
+                    lot["cost_local"] -= lot["cost_local"] * frac
+                    remaining = 0
+            continue
+
+    rows = []
+    for (broker, ticker_y), p in positions.items():
+        total_qty = sum(l["qty"] for l in p["lots"])
+        total_cost_eur = sum(l["cost_eur"] for l in p["lots"])
+        total_cost_local = sum(l["cost_local"] for l in p["lots"])
+        if abs(total_qty) < MIN_POSITION:
+            continue
+        avg_eur = total_cost_eur / total_qty if total_qty else math.nan
+        avg_local = total_cost_local / total_qty if total_qty else math.nan
+        rows.append({
+            "Broker": broker,
+            "Ticker": p.get("ticker_orig") or ticker_y,
+            "Ticker_Yahoo": ticker_y,
+            "Nombre": p["name"],
+            "Titulos": total_qty,
+            "Precio Medio Moneda": avg_local,
+            "Precio Medio €": avg_eur,
+            "Inversion €": total_cost_eur,
+            "Moneda Activo": p["pos_currency"] or "EUR",
+            "Tipo activo": p.get("pos_type") or "",
+        })
+
+    if not rows:
+        return pd.DataFrame(columns=["Broker", "Ticker", "Ticker_Yahoo", "Nombre", "Titulos", "Precio Medio Moneda", "Precio Medio €", "Inversion €", "Moneda Activo"])
+    return pd.DataFrame(rows)
+
+
 @st.cache_data(ttl=300)
 def get_quotes(tickers: list[str]) -> pd.DataFrame:
     """
@@ -1500,16 +1947,43 @@ def get_fx_rate(pair: str) -> float:
 
 
 @st.cache_data(ttl=3600)
-def get_fx_rate_for_date(currency: str, as_of_date) -> float:
+def get_fx_rate_ecb(currency: str, as_of_date) -> float:
     """
-    Tipo de cambio de cierre para una fecha: cuántos EUR por 1 unidad de moneda.
-    Por ejemplo USD -> 0.92 significa 1 USD = 0.92 EUR.
+    Tipo de cambio BCE (Frankfurter API, datos oficiales) para una fecha.
+    Devuelve cuántos EUR por 1 unidad de moneda. Ej: USD -> 0.92 significa 1 USD = 0.92 EUR.
+    Usa la misma fuente que Filios para coincidir en declaraciones fiscales.
     """
     if not currency or str(currency).upper() == "EUR":
         return 1.0
     ccy = str(currency).upper()
     try:
-        # USDEUR=X: precio en EUR de 1 USD (cierre del día)
+        date_str = pd.Timestamp(as_of_date).strftime("%Y-%m-%d")
+        url = f"https://api.frankfurter.app/{date_str}?from={ccy}&to=EUR"
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+        rates = data.get("rates", {})
+        if "EUR" in rates:
+            return float(rates["EUR"])
+        return math.nan
+    except Exception:
+        return math.nan
+
+
+@st.cache_data(ttl=3600)
+def get_fx_rate_for_date(currency: str, as_of_date) -> float:
+    """
+    Tipo de cambio de cierre para una fecha: cuántos EUR por 1 unidad de moneda.
+    Usa BCE (Frankfurter) por defecto - misma fuente que Filios.
+    Fallback a Yahoo Finance si la API BCE no responde.
+    """
+    if not currency or str(currency).upper() == "EUR":
+        return 1.0
+    rate = get_fx_rate_ecb(currency, as_of_date)
+    if not math.isnan(rate) and rate > 0:
+        return rate
+    # Fallback: Yahoo Finance
+    ccy = str(currency).upper()
+    try:
         pair = f"{ccy}EUR=X"
         tk = yf.Ticker(pair)
         start = pd.Timestamp(as_of_date)
@@ -1517,16 +1991,15 @@ def get_fx_rate_for_date(currency: str, as_of_date) -> float:
         hist = tk.history(start=start, end=end)
         if not hist.empty and "Close" in hist.columns:
             return float(hist["Close"].iloc[-1])
-        # Fallback: EURUSD=X -> 1/EURUSD para tener EUR por USD
         pair_eur = f"EUR{ccy}=X"
         tk2 = yf.Ticker(pair_eur)
         hist2 = tk2.history(start=start, end=end)
         if not hist2.empty and "Close" in hist2.columns:
-            rate = float(hist2["Close"].iloc[-1])
-            return 1.0 / rate if rate and rate != 0 else math.nan
-        return math.nan
+            r = float(hist2["Close"].iloc[-1])
+            return 1.0 / r if r and r != 0 else math.nan
     except Exception:
-        return math.nan
+        pass
+    return math.nan
 
 
 @st.cache_data(ttl=1800)
@@ -1560,13 +2033,25 @@ def get_fx_rate_at_datetime(currency: str, as_of_datetime: str) -> float:
 
 
 def _cotizaciones_signature(positions: pd.DataFrame) -> str:
-    """Firma de la cartera (broker + ticker) para validar si la caché aplica."""
+    """Firma de la cartera (broker + ticker + inversión) para validar si la caché aplica."""
     if positions.empty or "Broker" not in positions.columns:
         return ""
     ticker_col = "Ticker_Yahoo" if "Ticker_Yahoo" in positions.columns else "Ticker"
     if ticker_col not in positions.columns:
         return ""
-    keys = sorted(zip(positions["Broker"].astype(str), positions[ticker_col].astype(str)))
+    inv_col = "Inversion €" if "Inversion €" in positions.columns else None
+    inv_vals = (
+        positions[inv_col].fillna(0).round(2).astype(str)
+        if inv_col
+        else ["0"] * len(positions)
+    )
+    keys = sorted(
+        zip(
+            positions["Broker"].astype(str),
+            positions[ticker_col].astype(str),
+            inv_vals,
+        )
+    )
     return hashlib.sha256(repr(keys).encode()).hexdigest()
 
 
@@ -1607,9 +2092,31 @@ def clear_cotizaciones_cache() -> None:
         pass
 
 
-def enrich_with_market_data(positions: pd.DataFrame) -> pd.DataFrame:
+def load_precios_manuales() -> dict[str, float]:
+    """Carga precios manuales desde JSON (ticker_yahoo -> precio en EUR)."""
+    try:
+        if Path(PRECIOS_MANUALES_PATH).exists():
+            with open(PRECIOS_MANUALES_PATH, encoding="utf-8") as f:
+                data = json.load(f)
+                return {k: float(v) for k, v in (data or {}).items()}
+    except Exception:
+        pass
+    return {}
+
+
+def save_precios_manuales(data: dict[str, float]) -> None:
+    """Guarda precios manuales en JSON."""
+    try:
+        with open(PRECIOS_MANUALES_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+
+
+def enrich_with_market_data(positions: pd.DataFrame, manual_prices: dict[str, float] | None = None) -> pd.DataFrame:
     """
     Añade precios actuales, valor de mercado y plusvalías en EUR.
+    manual_prices: dict ticker_yahoo -> precio en EUR para posiciones sin cotización en Yahoo.
     """
     if positions.empty:
         return positions
@@ -1626,6 +2133,15 @@ def enrich_with_market_data(positions: pd.DataFrame) -> pd.DataFrame:
         right_index=True,
         how="left",
     )
+
+    # Aplicar precios manuales para posiciones sin cotización en Yahoo
+    if manual_prices:
+        for idx, row in positions.iterrows():
+            t = str(row.get(ticker_col) or "").strip()
+            if t and t in manual_prices and (pd.isna(row.get("Precio Actual")) or row.get("Precio Actual") is None):
+                positions.at[idx, "Precio Actual"] = manual_prices[t]
+                positions.at[idx, "Moneda Yahoo"] = "EUR"
+                positions.at[idx, "Moneda Activo"] = "EUR"
 
     # Determinamos moneda del activo (prioridad Yahoo, luego CSV)
     def decide_ccy(row: pd.Series) -> str:
@@ -1769,7 +2285,7 @@ def compute_fifo_all(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
 
     for _, row in data.iterrows():
         broker = _safe_get(row, "broker")
-        ticker_y = _safe_get(row, "ticker_Yahoo")
+        ticker_y = _safe_get(row, "ticker_Yahoo") or _safe_get(row, "ticker")
         ticker_orig = _safe_get(row, "ticker")
         nombre = _safe_get(row, "name") or ticker_orig or ticker_y or ""
         tipo = _safe_get(row, "type")
@@ -1781,12 +2297,14 @@ def compute_fifo_all(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
         total_eur = pd.to_numeric(
             _safe_get(row, "totalWithComissionBaseCurrency"), errors="coerce"
         )
+        if pd.isna(total_eur):
+            total_eur = pd.to_numeric(_safe_get(row, "totalBaseCurrency"), errors="coerce")
 
-        # Ignoramos filas sin ticker
-        if ticker_y is None:
+        # Ignoramos filas sin ticker (usa ticker_Yahoo o ticker como fallback para Otros/warrants)
+        if ticker_y is None or (isinstance(ticker_y, str) and not str(ticker_y).strip()):
             continue
 
-        key_ticker = ticker_y
+        key_ticker = str(ticker_y).strip()
 
         # -------- SPLIT (puede venir sin broker, como BY6) --------
         if tipo_lower == "split":
@@ -1855,7 +2373,19 @@ def compute_fifo_all(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
                     lote["Cantidad"] -= consumed
                     remaining = 0.0
 
-            plusvalia = float(total_eur) - cost_hist
+            # Valor de transmisión fiscal: totalBase - comisión - impuestos (normativa española)
+            total_base = _to_float(_safe_get(row, "totalBaseCurrency"), 0.0)
+            fx = _to_float(_safe_get(row, "exchangeRate"), 1.0) or 1.0
+            comm = _to_float(_safe_get(row, "comission"), 0.0)
+            tax = _to_float(_safe_get(row, "taxes"), 0.0)
+            comm_ccy = str(_safe_get(row, "comissionCurrency") or "").strip().upper()
+            tax_ccy = str(_safe_get(row, "taxesCurrency") or "").strip().upper()
+            comm_eur = comm if comm_ccy == "EUR" else (comm * fx if fx and abs(fx) > 1e-9 else comm)
+            tax_eur = tax if tax_ccy == "EUR" else (tax * fx if fx and abs(fx) > 1e-9 else tax)
+            valor_transmision = total_base - comm_eur - tax_eur
+
+            dest_ret = _to_float(_safe_get(row, "destinationRetentionBaseCurrency"), 0.0)
+            plusvalia = float(valor_transmision) - cost_hist
             sales_rows.append(
                 {
                     "Broker": broker,
@@ -1865,8 +2395,9 @@ def compute_fifo_all(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
                     "Fecha venta": fecha,
                     "Cantidad vendida": float(qty_sell),
                     "Valor compra histórico (€)": cost_hist,
-                    "Valor venta (€)": float(total_eur),
+                    "Valor venta (€)": float(valor_transmision),
                     "Plusvalía / Minusvalía (€)": plusvalia,
+                    "Retención dest. (€)": dest_ret,
                     "Tipo activo": tipo_activo,
                 }
             )
@@ -1884,6 +2415,42 @@ def compute_fifo_all(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     return lots_df, sales_df
 
 
+def _consume_fifo_lotes_cripto_global(lots: list[dict], qty_to_consume: float) -> tuple[list[dict], float]:
+    """
+    Consume cantidad FIFO sobre la lista de lotes de compute_fifo_criptos (misma forma que sell).
+    Devuelve (nueva_lista_de_lotes, coste_histórico_consumido_en_eur).
+    """
+    remaining = qty_to_consume
+    cost_hist = 0.0
+    new_lots: list[dict] = []
+
+    for lote in lots:
+        if remaining <= 0:
+            new_lots.append(lote)
+            continue
+        lote_qty = lote["Cantidad"]
+        if lote_qty <= 0:
+            continue
+        if lote_qty <= remaining + 1e-8:
+            consumed = lote_qty
+            remaining -= consumed
+            cost_hist += consumed * lote["Precio medio €"]
+        else:
+            consumed = remaining
+            remaining = 0.0
+            cost_hist += consumed * lote["Precio medio €"]
+            lote_rest = lote_qty - consumed
+            new_lots.append(
+                {
+                    **lote,
+                    "Cantidad": lote_rest,
+                    "Coste histórico €": lote_rest * lote["Precio medio €"],
+                }
+            )
+
+    return new_lots, cost_hist
+
+
 def compute_fifo_criptos(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Calcula lotes vivos y ventas (permuta incluida) para CRIPTOS usando FIFO GLOBAL por ticker.
@@ -1892,7 +2459,9 @@ def compute_fifo_criptos(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     - sell / switch: consumen lotes FIFO global del ticker y generan plusvalía/minusvalía.
     - stakeReward: crea lotes con coste 0 (ganancia futura al vender).
     - brokerTransfer: neutro fiscalmente (se ignora para FIFO global).
-    - commission: por simplicidad inicial, se ignora aquí (su efecto ya va en los totales en EUR).
+    - commission: si la cantidad es en cripto (positionNumber > 0), consume FIFO global como la cartera
+      (comisión en moneda del activo); no genera fila de venta. Comisión solo en EUR sin cantidad en
+      cripto no altera lotes.
     """
     if df is None or df.empty:
         return pd.DataFrame(), pd.DataFrame()
@@ -1977,8 +2546,11 @@ def compute_fifo_criptos(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
         if tipo == "brokertransfer":
             continue
 
-        # Comisiones: simplificación inicial → se ignoran aquí (ya impactan en totales en EUR)
+        # Comisión pagada en cripto: reduce lotes FIFO global (alineado con compute_positions_criptos)
         if tipo == "commission":
+            lots = lots_by_ticker.get(ticker, [])
+            new_lots, _ = _consume_fifo_lotes_cripto_global(lots, qty)
+            lots_by_ticker[ticker] = new_lots
             continue
 
         # Ventas / permutas de salida: sell / switch
@@ -1987,47 +2559,33 @@ def compute_fifo_criptos(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
                 # Sin total en EUR no podemos valorar la venta
                 continue
 
-            remaining = qty
-            cost_hist = 0.0
             lots = lots_by_ticker.get(ticker, [])
-            new_lots: list[dict] = []
-
-            for lote in lots:
-                if remaining <= 0:
-                    new_lots.append(lote)
-                    continue
-                lote_qty = lote["Cantidad"]
-                if lote_qty <= 0:
-                    continue
-                if lote_qty <= remaining + 1e-8:
-                    consumed = lote_qty
-                    remaining -= consumed
-                    cost_hist += consumed * lote["Precio medio €"]
-                    # lote agotado → no se añade a new_lots
-                else:
-                    consumed = remaining
-                    remaining = 0.0
-                    cost_hist += consumed * lote["Precio medio €"]
-                    lote_rest = lote_qty - consumed
-                    new_lots.append(
-                        {
-                            **lote,
-                            "Cantidad": lote_rest,
-                            "Coste histórico €": lote_rest * lote["Precio medio €"],
-                        }
-                    )
-
+            new_lots, cost_hist = _consume_fifo_lotes_cripto_global(lots, qty)
             lots_by_ticker[ticker] = new_lots
 
+            # Valor de transmisión fiscal: totalBase - comisión - impuestos (normativa española)
+            total_base = _to_float(row.get("totalBaseCurrency"), 0.0)
+            fx = _to_float(row.get("exchangeRate"), 1.0) or 1.0
+            comm = _to_float(row.get("comission"), 0.0)
+            tax = _to_float(row.get("taxes"), 0.0)
+            comm_ccy = str(row.get("comissionCurrency") or "").strip().upper()
+            tax_ccy = str(row.get("taxesCurrency") or "").strip().upper()
+            comm_eur = comm if comm_ccy == "EUR" else (comm * fx if fx and abs(fx) > 1e-9 else comm)
+            tax_eur = tax if tax_ccy == "EUR" else (tax * fx if fx and abs(fx) > 1e-9 else tax)
+            valor_transmision = total_base - comm_eur - tax_eur
+
+            dest_ret = _to_float(row.get("destinationRetentionBaseCurrency"), 0.0)
             sales_rows.append(
                 {
                     "Broker": broker,
                     "Ticker": ticker,
+                    "Nombre": nombre,
                     "Fecha venta": date_str,
                     "Cantidad vendida": qty,
-                    "Valor venta (€)": total_eur,
+                    "Valor venta (€)": valor_transmision,
                     "Valor compra histórico (€)": cost_hist,
-                    "Plusvalía / Minusvalía (€)": total_eur - cost_hist,
+                    "Plusvalía / Minusvalía (€)": valor_transmision - cost_hist,
+                    "Retención dest. (€)": dest_ret,
                     "Tipo activo": "crypto",
                 }
             )
@@ -2045,23 +2603,43 @@ def compute_fifo_criptos(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     return lots_df, sales_df
 
 
+def _consume_lots_fifo(lots: list[dict], qty_to_consume: float) -> float:
+    """
+    Consume qty_to_consume de los lotes en orden FIFO. Devuelve el coste consumido en EUR.
+    Modifica lots in-place.
+    """
+    remaining = qty_to_consume
+    cost_consumed = 0.0
+    while remaining > MIN_POSITION and lots:
+        lot = lots[0]
+        lot_qty = lot["qty"]
+        if lot_qty <= remaining + MIN_POSITION:
+            cost_consumed += lot["cost_eur"]
+            remaining -= lot_qty
+            lots.pop(0)
+        else:
+            frac = remaining / lot_qty
+            cost_consumed += lot["cost_eur"] * frac
+            lot["qty"] -= remaining
+            lot["cost_eur"] -= lot["cost_eur"] * frac
+            remaining = 0
+    return cost_consumed
+
+
 def compute_positions_criptos(df: pd.DataFrame) -> pd.DataFrame:
     """
     Calcula posiciones de cripto por broker y ticker a partir de movimientos_criptos.
-    Reproduce la lógica validada en calcular_posiciones_criptos.py:
-    - Orden por fecha+hora; en empate, brokerTransfer antes que commission.
-    - buy / switchBuy: suma cantidad (restando comisión si está en la misma cripto).
-    - sell / switch: resta cantidad (restando comisión si está en la misma cripto).
-    - brokerTransfer: mueve cantidad entre brokers (resolviendo IDs de wallet → broker).
-    - commission: resta cantidad si la comisión está en la misma cripto.
-    - stakeReward: suma cantidad.
-    - Descarta posiciones prácticamente cerradas (< MIN_POSITION).
+    Usa FIFO para ventas, switch y traspasos (como Filios).
+    - buy / switchBuy: añade lote FIFO.
+    - sell / switch: consume lotes FIFO.
+    - brokerTransfer: mueve lotes FIFO de origen a destino.
+    - commission: consume cantidad FIFO (sin coste).
+    - stakeReward: añade lote con coste 0.
     """
     if df is None or df.empty:
         return pd.DataFrame(columns=["Broker", "Ticker", "Ticker_Yahoo", "Nombre", "Cantidad"])
 
     df = df.copy()
-    # Normalizar datetime y orden secundario (brokerTransfer antes que commission)
     if "date" in df.columns:
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
     if "time" in df.columns:
@@ -2081,14 +2659,14 @@ def compute_positions_criptos(df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_values(["datetime", "_order"]).reset_index(drop=True)
     df = df.drop(columns=["_order"], errors="ignore")
 
-    # positions[(broker, ticker)] = {"qty": float, "cost_eur": float}
-    positions: dict[tuple[str, str], dict[str, float]] = {}
+    # positions[(broker, ticker)] = {"lots": [{"qty", "cost_eur"}, ...]} orden FIFO
+    positions: dict[tuple[str, str], dict] = {}
     meta: dict[tuple[str, str], dict[str, str]] = {}
 
     def ensure(broker: str, ticker: str, row: pd.Series):
         key = (broker, ticker)
         if key not in positions:
-            positions[key] = {"qty": 0.0, "cost_eur": 0.0}
+            positions[key] = {"lots": []}
             meta[key] = {
                 "Broker": broker,
                 "Ticker": ticker,
@@ -2119,67 +2697,69 @@ def compute_positions_criptos(df: pd.DataFrame) -> pd.DataFrame:
         dest = CRYPTO_BROKER_IDS.get(dest_raw, dest_raw if dest_raw else "")
 
         if tipo == "buy":
+            # Comisión en misma moneda: reducir qty y coste proporcionalmente (la comisión no aumenta la base)
+            qty_orig = qty
             if com_ccy == ticker and com_val > 0:
                 qty = max(0.0, qty - com_val)
+                # Coste solo sobre la cantidad neta recibida
+                total_eur = total_eur * (qty / qty_orig) if qty_orig > 0 else 0.0
+            if qty <= 0:
+                continue
             key = ensure(broker, ticker, row)
-            positions[key]["qty"] += qty
-            positions[key]["cost_eur"] += total_eur
+            positions[key]["lots"].append({"qty": qty, "cost_eur": total_eur})
         elif tipo == "sell":
             key = ensure(broker, ticker, row)
-            pos = positions[key]
-            if pos["qty"] <= 0 or qty <= 0:
+            lots = positions[key]["lots"]
+            if qty <= 0:
                 continue
-            sell_qty = min(qty, pos["qty"])
-            avg_cost = pos["cost_eur"] / pos["qty"] if pos["qty"] else 0.0
-            remaining_qty = pos["qty"] - sell_qty
-            pos["qty"] = remaining_qty
-            pos["cost_eur"] = avg_cost * remaining_qty
+            _consume_lots_fifo(lots, min(qty, sum(l["qty"] for l in lots)))
         elif tipo == "switch":
             if com_ccy == ticker and com_val > 0:
                 qty = max(0.0, qty - com_val)
             key = ensure(broker, ticker, row)
-            pos = positions[key]
-            if pos["qty"] <= 0 or qty <= 0:
+            lots = positions[key]["lots"]
+            total_q = sum(l["qty"] for l in lots)
+            if qty <= 0 or total_q <= 0:
                 continue
-            sell_qty = min(qty, pos["qty"])
-            avg_cost = pos["cost_eur"] / pos["qty"] if pos["qty"] else 0.0
-            remaining_qty = pos["qty"] - sell_qty
-            pos["qty"] = remaining_qty
-            pos["cost_eur"] = avg_cost * remaining_qty
+            _consume_lots_fifo(lots, min(qty, total_q))
         elif tipo == "switchbuy":
+            qty_orig = qty
             if com_ccy == ticker and com_val > 0:
                 qty = max(0.0, qty - com_val)
+                total_eur = total_eur * (qty / qty_orig) if qty_orig > 0 else 0.0
+            if qty <= 0:
+                continue
             key = ensure(broker, ticker, row)
-            positions[key]["qty"] += qty
-            positions[key]["cost_eur"] += total_eur
+            positions[key]["lots"].append({"qty": qty, "cost_eur": total_eur})
         elif tipo == "brokertransfer":
             if not dest:
                 continue
             sk = ensure(broker, ticker, row)
             dk = ensure(dest, ticker, row)
-            src = positions[sk]
-            dst = positions[dk]
-            if src["qty"] <= 0 or qty <= 0:
+            src_lots = positions[sk]["lots"]
+            dst_lots = positions[dk]["lots"]
+            total_src = sum(l["qty"] for l in src_lots)
+            if qty <= 0 or total_src <= 0:
                 continue
-            transfer_qty = min(qty, src["qty"])
-            ratio = transfer_qty / src["qty"]
-            transfer_cost = src["cost_eur"] * ratio
-            src["qty"] -= transfer_qty
-            src["cost_eur"] -= transfer_cost
-            dst["qty"] += transfer_qty
-            dst["cost_eur"] += transfer_cost
+            transfer_qty = min(qty, total_src)
+            cost_moved = _consume_lots_fifo(src_lots, transfer_qty)
+            dst_lots.append({"qty": transfer_qty, "cost_eur": cost_moved})
         elif tipo == "commission":
             key = ensure(broker, ticker, row)
-            pos = positions[key]
-            # Comisión en cripto: reducimos cantidad, mantenemos cost_eur (sube precio medio)
-            pos["qty"] = max(0.0, pos["qty"] - qty)
+            lots = positions[key]["lots"]
+            # Comisión: consume cantidad FIFO (solo reduce qty, el coste se pierde)
+            total_q = sum(l["qty"] for l in lots)
+            if qty > 0 and total_q > 0:
+                _consume_lots_fifo(lots, min(qty, total_q))
         elif tipo == "stakereward":
             key = ensure(broker, ticker, row)
-            # Recompensas: aumentan cantidad con coste 0 (bajan precio medio)
-            positions[key]["qty"] += qty
+            if qty > 0:
+                positions[key]["lots"].append({"qty": qty, "cost_eur": 0.0})
 
-    # Ajuste Kraken BTC con ledger oficial: saldo 0 (usando balances finales por wallet)
+    # Ajuste Kraken BTC con ledger oficial: solo mostrar si hay saldo > 0
+    # Si no hay ledger o saldo 0, eliminar Kraken para no mostrar posiciones obsoletas
     ledger_path = Path(__file__).parent / "kraken_stocks_etfs_ledgers_2025-01-13-2025-12-31.csv"
+    kraken_btc: float | None = None
     if ledger_path.exists():
         try:
             led = pd.read_csv(
@@ -2209,29 +2789,34 @@ def compute_positions_criptos(df: pd.DataFrame) -> pd.DataFrame:
                 kraken_btc = float(last_balances.sum())
                 if abs(kraken_btc) < 10 ** -8:
                     kraken_btc = 0.0
-                if ("Kraken", "BTC") in positions:
-                    positions[("Kraken", "BTC")] = kraken_btc
-                else:
-                    positions[("Kraken", "BTC")] = kraken_btc
-                    meta[("Kraken", "BTC")] = {
-                        "Broker": "Kraken",
-                        "Ticker": "BTC",
-                        "Ticker_Yahoo": "BTC-EUR",
-                        "Nombre": "Bitcoin",
-                    }
         except Exception:
-            pass
+            kraken_btc = None
+    # Sin ledger o saldo 0: eliminar Kraken
+    if kraken_btc is None or kraken_btc == 0.0:
+        for k in [("Kraken", "BTC")]:
+            positions.pop(k, None)
+            meta.pop(k, None)
+    else:
+        # Saldo > 0: añadir o actualizar
+        positions[("Kraken", "BTC")] = kraken_btc
+        meta[("Kraken", "BTC")] = {
+            "Broker": "Kraken",
+            "Ticker": "BTC",
+            "Ticker_Yahoo": "BTC-EUR",
+            "Nombre": "Bitcoin",
+        }
 
     # Construir DataFrame de posiciones abiertas (solo brokers con saldo > 0)
     rows_pos: list[dict] = []
     for key, pos in positions.items():
-        # Por compatibilidad con posibles valores antiguos (floats sueltos)
+        # Kraken BTC puede ser float (ledger); resto usa lots FIFO
         if not isinstance(pos, dict):
             qty = float(pos)
             cost_eur = 0.0
         else:
-            qty = float(pos.get("qty", 0.0))
-            cost_eur = float(pos.get("cost_eur", 0.0))
+            lots = pos.get("lots", [])
+            qty = sum(l["qty"] for l in lots)
+            cost_eur = sum(l["cost_eur"] for l in lots)
         if abs(qty) < MIN_POSITION:
             continue
         info = meta.get(key, {})
@@ -2261,7 +2846,12 @@ def main() -> None:
     df = load_data()
 
     # Menú izquierda: solo páginas
-    vista = st.sidebar.radio("Página", ["Cartera", "Movimientos", "Fiscalidad", "Brokers"], index=0, label_visibility="collapsed")
+    vista = st.sidebar.radio(
+        "Página",
+        ["Cartera", "Movimientos", "Fiscalidad", "Brokers", "Catálogo"],
+        index=0,
+        label_visibility="collapsed",
+    )
 
     # Ruta de datos siempre visible (para saber dónde se guarda)
     st.sidebar.caption("**📁 Ubicación de datos:**")
@@ -2313,7 +2903,6 @@ def main() -> None:
                             out_exp[col] = out_exp[col].astype(str)
                     csv_str = out_exp.to_csv(index=False, decimal=CSV_DECIMAL, sep=CSV_SEP, encoding=CSV_ENCODING)
                     csv_bytes = csv_str.encode(CSV_ENCODING)
-                    # Guardar en DATA_DIR (con addon_config:rw es /config, accesible por Samba)
                     export_dir = _DATA_DIR / "cartera_export"
                     export_path = export_dir / "acciones.csv"
                     try:
@@ -2337,7 +2926,6 @@ def main() -> None:
                             '⬇️ Descargar (enlace alternativo)</a>',
                             unsafe_allow_html=True,
                         )
-        # Restaurar: subir CSV desde el PC
         uploaded_acc = st.file_uploader("Restaurar acciones desde CSV", type=["csv"], key="upload_acciones")
         if uploaded_acc is not None:
             try:
@@ -2381,8 +2969,6 @@ def main() -> None:
                         st.success(f"Exportado a **{export_dir}/fondos.csv**")
                     except Exception as e:
                         st.error(f"No se pudo guardar: {e}")
-        st.caption(f"_Datos en: {_DATA_DIR} (Samba: addon_configs)_")
-        # Restaurar fondos: subir CSV
         uploaded_fondos = st.file_uploader("Restaurar fondos desde CSV", type=["csv"], key="upload_fondos")
         if uploaded_fondos is not None:
             try:
@@ -2407,11 +2993,87 @@ def main() -> None:
                     st.error("El CSV no tiene las columnas esperadas.")
             except Exception as e:
                 st.error(f"No se pudo leer el CSV: {e}")
+        st.caption("**Criptos:**")
+        if st.button("Exportar criptos a movimientos_criptos.csv (respaldo)"):
+            if export_criptos_to_csv():
+                st.success("Exportado a movimientos_criptos.csv. Recargando…")
+                st.rerun()
+            else:
+                st.error("No se pudo exportar criptos.")
         st.caption("**Totales:**")
         if st.button("📐 Recalcular totales", key="btn_recalc_totals", help="Recalcula total, totalBaseCurrency, totalWithComission y totalWithComissionBaseCurrency para todos los movimientos (acciones, fondos, criptos). No actualiza si detecta anomalías."):
             n, msg = recalc_all_totals()
             st.success(msg)
             st.rerun()
+        if st.button("🔄 Recalcular con tipos BCE (como Filios)", key="btn_recalc_ecb", help="Actualiza exchangeRate con tipos del Banco Central Europeo y recalcula totales. Usa la misma fuente que Filios para coincidir en costes en EUR."):
+            n, msg = recalc_all_totals(use_ecb_rates=True)
+            st.success(msg)
+            st.rerun()
+
+    if vista == "Catálogo":
+        st.header("Catálogo de instrumentos")
+        st.caption(
+            "ISIN es **global** por ticker Yahoo (clave de cotización). "
+            "Ticker, nombre y Yahoo se escriben en **todos** los movimientos y dividendos que compartan ese Yahoo. "
+            "No se actualizan referencias en campos de permuta (switch) que apunten a otro texto."
+        )
+        uni = get_universe_instruments_table()
+        if uni.empty:
+            st.info("No hay instrumentos en movimientos.")
+        else:
+            _CAT_PLACEHOLDER = "—— Elige instrumento ——"
+            uni_pick = uni.copy()
+            uni_pick["_sn"] = uni_pick["name"].fillna("").astype(str).str.strip().str.lower()
+            uni_pick = uni_pick.sort_values(["_sn", "ticker_Yahoo"]).drop(columns=["_sn"])
+            yahoo_ordered = uni_pick["ticker_Yahoo"].tolist()
+            cat_options = [_CAT_PLACEHOLDER] + yahoo_ordered
+
+            def _fmt_cat_row(opt: str) -> str:
+                if opt == _CAT_PLACEHOLDER:
+                    return _CAT_PLACEHOLDER
+                r = uni.loc[uni["ticker_Yahoo"] == opt].iloc[0]
+                nm = str(r.get("name") or "").strip() or "—"
+                t = str(r.get("ticker") or "").strip()
+                o = str(r.get("Origen") or "").strip()
+                y = str(opt).strip()
+                bits = [nm, y]
+                if t and t != y:
+                    bits.append(t)
+                tail = f" ({o})" if o else ""
+                return " · ".join(bits) + tail
+
+            sel = st.selectbox(
+                "Instrumento (busca por nombre, ticker o Yahoo)",
+                cat_options,
+                index=0,
+                format_func=_fmt_cat_row,
+                key="cat_instr_sel",
+            )
+            if sel != _CAT_PLACEHOLDER:
+                row = uni.loc[uni["ticker_Yahoo"] == sel].iloc[0]
+                c1, c2 = st.columns(2)
+                with c1:
+                    ny = st.text_input("Ticker Yahoo", value=sel, key=f"cat_y_{sel}")
+                    nt = st.text_input("Ticker", value=str(row.get("ticker") or ""), key=f"cat_t_{sel}")
+                with c2:
+                    nn = st.text_input("Nombre", value=str(row.get("name") or ""), key=f"cat_n_{sel}")
+                    ni = st.text_input("ISIN (opcional)", value=str(row.get("ISIN") or ""), key=f"cat_i_{sel}")
+                if st.button("Guardar cambios", type="primary", key="cat_save"):
+                    ok, msg = apply_global_instrument_update(sel, ny.strip(), nt.strip(), nn.strip(), ni.strip())
+                    if ok:
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.error(msg)
+            else:
+                st.info("Selecciona un instrumento en el desplegable para cargar y editar sus datos.")
+            st.subheader("Vista previa")
+            st.dataframe(
+                uni.sort_values("ticker_Yahoo").reset_index(drop=True),
+                use_container_width=True,
+                hide_index=True,
+            )
+        return
 
     if vista == "Movimientos":
         st.header("Movimientos")
@@ -2439,7 +3101,7 @@ def main() -> None:
                 # Paso 1: ¿Qué quieres registrar?
                 tipo_registro = st.radio(
                     "¿Qué quieres registrar?",
-                    ["Acciones/ETFs", "Fondos", "Criptos"],
+                    ["Acciones/ETFs", "Fondos", "Criptos", "Otros"],
                     index=0,
                     horizontal=True,
                     key="tipo_registro_nuevo",
@@ -2447,97 +3109,29 @@ def main() -> None:
                 if tipo_registro == "Acciones/ETFs":
                     position_type_base = "stock"
                     catalog_activo = catalog
+                    tipo_nuevo = st.selectbox("Tipo de activo", ["Acción", "ETF"], key="new_tipo")
+                    position_type = "stock" if tipo_nuevo == "Acción" else "etf"
                 elif tipo_registro == "Fondos":
                     position_type_base = "fund"
                     catalog_activo = catalog_fondos
+                elif tipo_registro == "Otros":
+                    position_type_base = "warrant"
+                    catalog_activo = catalog
+                    if not catalog.empty and "positionType" in catalog.columns:
+                        catalog_activo = catalog[catalog["positionType"].astype(str).str.strip().str.lower() == "warrant"].copy()
+                    position_type = "warrant"
                 else:
                     position_type_base = "crypto"
                     catalog_activo = catalog_criptos
+                    position_type = "crypto"
 
-                # Paso 2: Filtro de posición
-                st.caption("Elige una posición existente o crea una nueva.")
-                pos_origen = st.radio(
-                    "¿La posición ya existe?",
-                    ["Sí, elegir de la lista", "No, es una posición nueva"],
-                    index=0,
-                    horizontal=True,
-                    key="pos_existente_o_nueva",
-                )
-
-                position_currency = "EUR"
-                position_ticker = position_yahoo = position_name = position_exchange = position_country = ""
-                position_type = position_type_base
-
-                if pos_origen == "No, es una posición nueva":
-                    nc1, nc2, nc3 = st.columns(3)
-                    with nc1:
-                        ticker_placeholder = "Ej: BTC, ETH…" if tipo_registro == "Criptos" else "AAPL, ES01234567890…"
-                        position_ticker = st.text_input("Ticker", key="new_ticker", placeholder=ticker_placeholder)
-                        if tipo_registro != "Criptos":
-                            position_yahoo = st.text_input("Ticker Yahoo", key="new_yahoo", placeholder="Para cotizaciones; puede ser = ticker")
-                    with nc2:
-                        position_name = st.text_input("Nombre del activo", key="new_name", placeholder="Ej. Apple Inc.")
-                        position_currency = st.selectbox("Moneda", currencies_in_data, key="new_ccy")
-                    with nc3:
-                        if tipo_registro == "Acciones/ETFs":
-                            tipo_nuevo = st.selectbox("Tipo", ["Acción", "ETF"], key="new_tipo")
-                            position_type = "stock" if tipo_nuevo == "Acción" else "etf"
-                        elif tipo_registro == "Fondos":
-                            position_type = "fund"
-                            st.caption("Fondo")
-                        else:
-                            position_type = "crypto"
-                            st.caption("Cripto")
-                        if tipo_registro != "Fondos":
-                            position_exchange = st.text_input("Bolsa (opcional)", key="new_exchange", placeholder="XETRA, NASDAQ…")
-                            position_country = st.text_input("País (opcional)", key="new_country", placeholder="DE, US…")
-                else:
-                    ticker_options = ["—— Elige posición ——"]
-                    option_to_catalog = []
-                    if catalog_activo.empty and tipo_registro == "Criptos":
-                        st.info("No hay criptos en cartera. Elige «posición nueva» para registrar tu primera operación.")
-                    if not catalog_activo.empty:
-                        for idx, (_, r) in enumerate(catalog_activo.iterrows()):
-                            lab = f"{r['ticker']} | {r['name']} ({r.get('positionCurrency', 'EUR')})"
-                            if tipo_registro == "Fondos":
-                                lab += " [Fondo]"
-                            elif tipo_registro == "Criptos":
-                                lab += " [Cripto]"
-                            ticker_options.append(lab)
-                            option_to_catalog.append(idx)
-                    sel_pos = st.selectbox("Posición", ticker_options, key="sel_pos_nuevo")
-                    if sel_pos and sel_pos != "—— Elige posición ——" and option_to_catalog and not catalog_activo.empty:
-                        idx_opt = ticker_options.index(sel_pos) - 1
-                        if 0 <= idx_opt < len(catalog_activo):
-                            r = catalog_activo.iloc[idx_opt]
-                            position_currency = str(r.get("positionCurrency", "EUR")) if pd.notna(r.get("positionCurrency")) else "EUR"
-                            position_ticker = str(r["ticker"]) if pd.notna(r["ticker"]) else ""
-                            position_yahoo = str(r.get("ticker_Yahoo", position_ticker)) if pd.notna(r.get("ticker_Yahoo")) else position_ticker
-                            position_name = str(r.get("name", position_ticker)) if pd.notna(r.get("name")) else position_ticker
-                            position_exchange = str(r.get("positionExchange", "")) if pd.notna(r.get("positionExchange")) else ""
-                            position_country = str(r.get("positionCountry", "")) if pd.notna(r.get("positionCountry")) else ""
-                            if "positionType" in r and pd.notna(r["positionType"]):
-                                position_type = str(r["positionType"]).strip().lower()
-                            else:
-                                position_type = position_type_base
-                        st.caption(f"Moneda: **{position_currency}** · Tipo: **{position_type}**")
-
-                sel_pos = st.session_state.get("sel_pos_nuevo", "—— Elige posición ——") if pos_origen == "Sí, elegir de la lista" else "➕ Nueva posición"
-                es_posicion_nueva = pos_origen == "No, es una posición nueva"
-
-                default_ccy_for_fees = position_currency or "EUR"
-                if "last_pos_for_ccy" not in st.session_state or st.session_state["last_pos_for_ccy"] != (sel_pos + tipo_registro):
-                    st.session_state["ccy_com"] = default_ccy_for_fees
-                    st.session_state["ccy_tax"] = default_ccy_for_fees
-                    st.session_state["last_pos_for_ccy"] = sel_pos + tipo_registro
-
-                # Paso 3: Filtro de operaciones según tipo
-                if tipo_registro == "Acciones/ETFs":
+                # Paso 2: Tipo de operación (primero, porque define qué campos se muestran)
+                if tipo_registro in ("Acciones/ETFs", "Otros"):
                     op_options = [("buy", "Compra"), ("sell", "Venta"), ("dividend", "Dividendo"), ("split", "Split"), ("brokerTransfer", "Transferencia entre brokers")]
                 elif tipo_registro == "Fondos":
                     op_options = [("buy", "Compra"), ("sell", "Venta"), ("traspaso_fondos", "Traspaso")]
                 else:
-                    op_options = [("buy", "Compra"), ("sell", "Venta"), ("switch", "Permuta"), ("stakeReward", "Stake Reward")]
+                    op_options = [("buy", "Compra"), ("sell", "Venta"), ("switch", "Permuta"), ("stakeReward", "Stake Reward"), ("brokerTransfer", "Transferencia a wallet")]
 
                 op_type = st.selectbox(
                     "Tipo de operación",
@@ -2545,6 +3139,111 @@ def main() -> None:
                     format_func=lambda x: dict(op_options).get(x, x),
                     key="op_type_nuevo",
                 )
+
+                # Formularios con selector propio (sin Posición genérica): traspaso, transferencias, permuta
+                _form_propio = (
+                    (tipo_registro == "Fondos" and op_type == "traspaso_fondos")
+                    or (tipo_registro in ("Acciones/ETFs", "Otros") and op_type == "brokerTransfer")
+                    or (tipo_registro == "Criptos" and op_type == "brokerTransfer")
+                    or (tipo_registro == "Criptos" and op_type == "switch")
+                )
+
+                if not _form_propio:
+                    # Paso 3: Posición (solo para compra, venta, dividendo, split, stake reward)
+                    st.caption("Elige una posición existente o crea una nueva.")
+                    pos_origen = st.radio(
+                        "¿La posición ya existe?",
+                        ["Sí, elegir de la lista", "No, es una posición nueva"],
+                        index=0,
+                        horizontal=True,
+                        key="pos_existente_o_nueva",
+                    )
+
+                    position_currency = "EUR"
+                    position_ticker = position_yahoo = position_name = position_exchange = position_country = ""
+                    if tipo_registro not in ("Acciones/ETFs", "Otros"):
+                        position_type = position_type_base
+
+                    if pos_origen == "No, es una posición nueva":
+                        nc1, nc2, nc3 = st.columns(3)
+                        with nc1:
+                            ticker_placeholder = "Ej: BTC, ETH…" if tipo_registro == "Criptos" else "AAPL, ES01234567890…"
+                            position_ticker = st.text_input("Ticker", key="new_ticker", placeholder=ticker_placeholder)
+                            if tipo_registro != "Criptos":
+                                position_yahoo = st.text_input("Ticker Yahoo", key="new_yahoo", placeholder="Para cotizaciones; puede ser = ticker (vacío si no hay)")
+                        with nc2:
+                            position_name = st.text_input("Nombre del activo", key="new_name", placeholder="Ej. Apple Inc.")
+                            position_currency = st.selectbox("Moneda", currencies_in_data, key="new_ccy")
+                        with nc3:
+                            if tipo_registro == "Fondos":
+                                position_type = "fund"
+                                st.caption("Fondo")
+                            elif tipo_registro == "Criptos":
+                                position_type = "crypto"
+                                st.caption("Cripto")
+                            elif tipo_registro == "Otros":
+                                st.caption("Otros (warrants, etc.)")
+                            else:
+                                st.caption(f"Tipo: **{tipo_nuevo}**")
+                            if tipo_registro != "Fondos":
+                                position_exchange = st.text_input("Bolsa (opcional)", key="new_exchange", placeholder="XETRA, NASDAQ…")
+                                position_country = st.text_input("País (opcional)", key="new_country", placeholder="DE, US…")
+                    else:
+                        ticker_options = ["—— Elige posición ——"]
+                        option_to_catalog = []
+                        if catalog_activo.empty and tipo_registro == "Criptos":
+                            st.info("No hay criptos en cartera. Elige «posición nueva» para registrar tu primera operación.")
+                        if catalog_activo.empty and tipo_registro == "Otros":
+                            st.info("No hay posiciones de Otros en cartera. Elige «posición nueva» para registrar tu primera operación.")
+                        if not catalog_activo.empty:
+                            for idx, (_, r) in enumerate(catalog_activo.iterrows()):
+                                lab = f"{r['ticker']} | {r['name']} ({r.get('positionCurrency', 'EUR')})"
+                                if tipo_registro == "Fondos":
+                                    lab += " [Fondo]"
+                                elif tipo_registro == "Criptos":
+                                    lab += " [Cripto]"
+                                elif tipo_registro in ("Acciones/ETFs", "Otros"):
+                                    pt = str(r.get("positionType", "")).strip().lower()
+                                    if pt == "etf":
+                                        lab += " [ETF]"
+                                    elif pt == "warrant":
+                                        lab += " [Otros]"
+                                    else:
+                                        lab += " [Acción]"
+                                ticker_options.append(lab)
+                                option_to_catalog.append(idx)
+                        sel_pos = st.selectbox("Posición", ticker_options, key="sel_pos_nuevo")
+                        if sel_pos and sel_pos != "—— Elige posición ——" and option_to_catalog and not catalog_activo.empty:
+                            idx_opt = ticker_options.index(sel_pos) - 1
+                            if 0 <= idx_opt < len(catalog_activo):
+                                r = catalog_activo.iloc[idx_opt]
+                                position_currency = str(r.get("positionCurrency", "EUR")) if pd.notna(r.get("positionCurrency")) else "EUR"
+                                position_ticker = str(r["ticker"]) if pd.notna(r["ticker"]) else ""
+                                position_yahoo = str(r.get("ticker_Yahoo", position_ticker)) if pd.notna(r.get("ticker_Yahoo")) else position_ticker
+                                position_name = str(r.get("name", position_ticker)) if pd.notna(r.get("name")) else position_ticker
+                                position_exchange = str(r.get("positionExchange", "")) if pd.notna(r.get("positionExchange")) else ""
+                                position_country = str(r.get("positionCountry", "")) if pd.notna(r.get("positionCountry")) else ""
+                                if "positionType" in r and pd.notna(r["positionType"]):
+                                    position_type = str(r["positionType"]).strip().lower()
+                                else:
+                                    position_type = position_type_base
+                            st.caption(f"Moneda: **{position_currency}** · Tipo: **{position_type}**")
+
+                    sel_pos = st.session_state.get("sel_pos_nuevo", "—— Elige posición ——") if pos_origen == "Sí, elegir de la lista" else "➕ Nueva posición"
+                    es_posicion_nueva = pos_origen == "No, es una posición nueva"
+
+                    default_ccy_for_fees = position_currency or "EUR"
+                    if "last_pos_for_ccy" not in st.session_state or st.session_state["last_pos_for_ccy"] != (sel_pos + tipo_registro):
+                        st.session_state["ccy_com"] = default_ccy_for_fees
+                        st.session_state["ccy_tax"] = default_ccy_for_fees
+                        st.session_state["last_pos_for_ccy"] = sel_pos + tipo_registro
+                else:
+                    position_currency = "EUR"
+                    position_ticker = position_yahoo = position_name = position_exchange = position_country = ""
+                    if tipo_registro not in ("Acciones/ETFs", "Otros"):
+                        position_type = position_type_base
+                    sel_pos = "——"
+                    es_posicion_nueva = False
 
                 # --- Formulario específico: Traspaso entre fondos (solo Fondos) ---
                 if tipo_registro == "Fondos" and op_type == "traspaso_fondos":
@@ -2636,28 +3335,29 @@ def main() -> None:
                                         append_operation_fondos(row_switch)
                                         append_operation_fondos(row_switchbuy)
                                         load_data_fondos.clear()
+                                        _clear_form_nueva_operacion()
                                         st.success("Traspaso guardado (switch + switchBuy en Fondos).")
                                         st.rerun()
                                     except Exception as e:
                                         st.error(f"Error al guardar: {e}")
                 # --- Formulario específico: Transferencia entre brokers (solo Acciones/ETFs) ---
-                elif tipo_registro == "Acciones/ETFs" and op_type == "brokerTransfer":
+                elif tipo_registro in ("Acciones/ETFs", "Otros") and op_type == "brokerTransfer":
                     st.caption("Transfiere títulos de una cuenta (broker) a otra. El coste se arrastra, no hay tributo.")
                     bt_pos_options = ["—— Elige posición ——"]
                     if not catalog_activo.empty:
                         for idx, (_, r) in enumerate(catalog_activo.iterrows()):
                             lab = f"{r.get('ticker', '')} | {r.get('name', '')}"
                             pt = str(r.get("positionType", "stock")).strip().lower()
-                            lab += " [ETF]" if pt == "etf" else " [Acción]"
+                            lab += " [ETF]" if pt == "etf" else (" [Otros]" if pt == "warrant" else " [Acción]")
                             bt_pos_options.append(lab)
                     bt_c1, bt_c2 = st.columns(2)
                     with bt_c1:
-                        bt_posicion = st.selectbox("Posición a transferir", bt_pos_options, key="bt_posicion")
-                        bt_qty = st.text_input("Cantidad a transferir", placeholder="0 o 0,0000", key="bt_qty")
-                        bt_fecha = st.date_input("Fecha", key="bt_fecha")
                         bt_broker_origen = st.selectbox("Broker origen", options=brokers_list, key="bt_broker_origen") if brokers_list else st.text_input("Broker origen", key="bt_broker_origen")
+                        bt_posicion = st.selectbox("Posición a transferir", bt_pos_options, key="bt_posicion")
+                        bt_fecha = st.date_input("Fecha", key="bt_fecha")
                     with bt_c2:
                         bt_broker_destino = st.selectbox("Broker destino", options=brokers_list, key="bt_broker_destino") if brokers_list else st.text_input("Broker destino", key="bt_broker_destino")
+                        bt_qty = st.text_input("Cantidad a transferir", placeholder="0 o 0,0000", key="bt_qty")
                         bt_hora = st.time_input("Hora", value=dt_time(12, 0), key="bt_hora", step=60)
                     if st.button("Guardar transferencia entre brokers", type="primary", key="guardar_bt"):
                         if bt_posicion == "—— Elige posición ——":
@@ -2680,7 +3380,7 @@ def main() -> None:
                                 name_o = str(ro.get("name") or ticker_o)
                                 ticker_yahoo = str(ro.get("ticker_Yahoo") or ticker_o)
                                 pt = str(ro.get("positionType", "stock")).strip().lower()
-                                position_type = pt if pt in ("stock", "etf") else "stock"
+                                position_type = pt if pt in ("stock", "etf", "warrant") else "stock"
                                 qty_val = _to_float(bt_qty, 0.0)
                                 date_str = bt_fecha.strftime("%Y-%m-%d") if hasattr(bt_fecha, "strftime") else str(bt_fecha)
                                 time_str = bt_hora.strftime("%H:%M:%S") if hasattr(bt_hora, "strftime") else "12:00:00"
@@ -2701,7 +3401,79 @@ def main() -> None:
                                 try:
                                     append_operation(row_bt)
                                     load_data.clear()
+                                    _clear_form_nueva_operacion()
                                     st.success("Transferencia entre brokers guardada.")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Error al guardar: {e}")
+                # --- Formulario específico: Transferencia cripto a wallet (brokerTransfer) ---
+                elif tipo_registro == "Criptos" and op_type == "brokerTransfer":
+                    st.caption("Transfiere cripto de una cuenta (broker/wallet) a otra. La comisión, si la hay, se descuenta en origen.")
+                    ctf_options = ["—— Elige cripto ——"]
+                    if not catalog_criptos.empty:
+                        for _, r in catalog_criptos.iterrows():
+                            ctf_options.append(f"{r['ticker']} | {r['name']}")
+                    ctf_crypto = st.selectbox("Cripto", ctf_options, key="ctf_crypto")
+                    ctf_c1, ctf_c2 = st.columns(2)
+                    with ctf_c1:
+                        ctf_broker_origen = st.selectbox("Broker/wallet origen", options=brokers_list, key="ctf_broker_origen") if brokers_list else st.text_input("Broker/wallet origen", key="ctf_broker_origen")
+                        ctf_qty = st.text_input("Cantidad recibida en destino", placeholder="0,00", key="ctf_qty", help="Lo que efectivamente llega a la wallet destino")
+                        ctf_fecha = st.date_input("Fecha", key="ctf_fecha")
+                    with ctf_c2:
+                        ctf_broker_destino = st.selectbox("Broker/wallet destino", options=brokers_list, key="ctf_broker_destino") if brokers_list else st.text_input("Broker/wallet destino", key="ctf_broker_destino")
+                        ctf_comision = st.text_input("Comisión (opcional)", placeholder="0 o 0,00", key="ctf_comision", help="Fee de red o del exchange; se descuenta en origen")
+                        ctf_hora = st.time_input("Hora", value=dt_time(12, 0), key="ctf_hora", step=60)
+                    if st.button("Guardar transferencia", type="primary", key="guardar_ctf"):
+                        if ctf_crypto == "—— Elige cripto ——":
+                            st.error("Elige la cripto a transferir.")
+                        elif not ctf_qty or _to_float(ctf_qty, 0.0) <= 0:
+                            st.error("Indica la cantidad recibida en destino.")
+                        elif not ctf_broker_origen or not str(ctf_broker_origen).strip():
+                            st.error("Indica el broker/wallet origen.")
+                        elif not ctf_broker_destino or not str(ctf_broker_destino).strip():
+                            st.error("Indica el broker/wallet destino.")
+                        elif str(ctf_broker_origen).strip() == str(ctf_broker_destino).strip():
+                            st.error("Origen y destino deben ser diferentes.")
+                        else:
+                            idx_ctf = ctf_options.index(ctf_crypto) - 1
+                            if idx_ctf < 0 or catalog_criptos.empty or idx_ctf >= len(catalog_criptos):
+                                st.error("Cripto no encontrada en el catálogo.")
+                            else:
+                                ro = catalog_criptos.iloc[idx_ctf]
+                                ticker = str(ro.get("ticker") or ro.get("ticker_Yahoo") or "")
+                                name = str(ro.get("name") or ticker)
+                                ticker_yahoo = _crypto_ticker_yahoo(ticker, ro.get("ticker_Yahoo") or "")
+                                qty_val = _to_float(ctf_qty, 0.0)
+                                com_val = _to_float(ctf_comision, 0.0)
+                                date_str = ctf_fecha.strftime("%Y-%m-%d") if hasattr(ctf_fecha, "strftime") else str(ctf_fecha)
+                                time_str = ctf_hora.strftime("%H:%M:%S") if hasattr(ctf_hora, "strftime") else "12:00:00"
+                                broker_orig = str(ctf_broker_origen).strip()
+                                broker_dest = str(ctf_broker_destino).strip()
+                                def _ctf_row(qty):
+                                    return {
+                                        "date": date_str, "time": time_str,
+                                        "ticker": ticker, "ticker_Yahoo": ticker_yahoo, "name": name,
+                                        "positionType": "crypto", "positionCountry": "", "positionCurrency": "EUR", "positionExchange": "",
+                                        "broker": broker_orig, "type": "brokerTransfer", "positionNumber": qty, "price": 0,
+                                        "comission": 0, "comissionCurrency": "", "destinationRetentionBaseCurrency": "", "taxes": 0, "taxesCurrency": "EUR",
+                                        "exchangeRate": 1.0, "positionQuantity": "", "autoFx": "No",
+                                        "switchBuyPosition": "", "switchBuyPositionType": "", "switchBuyPositionNumber": "", "switchBuyExchangeRate": "", "switchBuyBroker": "",
+                                        "spinOffBuyPosition": "", "spinOffBuyPositionNumber": "", "spinOffBuyPositionAllocation": "",
+                                        "brokerTransferNewBroker": broker_dest,
+                                        "total": 0, "totalBaseCurrency": 0, "totalWithComission": 0, "totalWithComissionBaseCurrency": 0,
+                                        "positionCustomType": "", "description": "",
+                                    }
+                                try:
+                                    if com_val > 0:
+                                        row_comm = _ctf_row(com_val)
+                                        row_comm["type"] = "commission"
+                                        row_comm["brokerTransferNewBroker"] = ""
+                                        append_operation_criptos(row_comm)
+                                    row_bt = _ctf_row(qty_val)
+                                    append_operation_criptos(row_bt)
+                                    load_data_criptos.clear()
+                                    _clear_form_nueva_operacion()
+                                    st.success("Transferencia guardada." + (" (comisión + transferencia)" if com_val > 0 else ""))
                                     st.rerun()
                                 except Exception as e:
                                     st.error(f"Error al guardar: {e}")
@@ -2807,6 +3579,7 @@ def main() -> None:
                                         append_operation_criptos(row_switch)
                                         append_operation_criptos(row_switchbuy)
                                         load_data_criptos.clear()
+                                        _clear_form_nueva_operacion()
                                         st.success("Permuta guardada (switch + switchBuy en Criptos).")
                                         st.rerun()
                                     except Exception as e:
@@ -2896,20 +3669,43 @@ def main() -> None:
                         _dest_str = st.text_input("Retención en destino (€)", placeholder="0 o 0,00", key="op_dest_nuevo")
                         op_dest_ret = _to_float(_dest_str, 0.0)
 
-                    # Previsualizar totales (en tiempo real)
-                    _total_prev = op_total_local
-                    _total_base_prev = _total_prev * op_exchange_rate
-                    _comm_eur = op_commission if op_commission_ccy == "EUR" else op_commission * op_exchange_rate
-                    _tax_eur = op_taxes if op_taxes_ccy == "EUR" else op_taxes * op_exchange_rate
-                    _total_with_comm_base = _total_base_prev + _comm_eur + _tax_eur
+                    # Previsualizar totales (misma lógica que al guardar, vía _recalc_totals)
+                    _prev = _recalc_totals(
+                        float(op_quantity or 0),
+                        float(op_price or 0),
+                        float(op_commission or 0),
+                        float(op_taxes or 0),
+                        float(op_exchange_rate or 1.0),
+                        str(position_currency or "EUR"),
+                        str(op_commission_ccy or ""),
+                        str(op_taxes_ccy or ""),
+                        tipo=str(op_type or ""),
+                    )
+                    _fmt_prev = lambda v: f"{v:,.2f}".replace(",", " ").replace(".", ",")
+
                     st.subheader("Previsualizar totales")
-                    prev1, prev2, prev3 = st.columns(3)
-                    with prev1:
-                        st.metric(f"Total ({position_currency})", f"{_total_prev:,.2f}".replace(",", " ").replace(".", ","))
-                    with prev2:
-                        st.metric("Total (EUR)", f"{_total_base_prev:,.2f}".replace(",", " ").replace(".", ",") + " €")
-                    with prev3:
-                        st.metric("Total + com. + imp. (EUR)", f"{_total_with_comm_base:,.2f}".replace(",", " ").replace(".", ",") + " €")
+                    if str(position_currency or "EUR").strip().upper() == "EUR":
+                        prev1, prev2 = st.columns(2)
+                        with prev1:
+                            st.metric("Total (EUR)", _fmt_prev(_prev["totalBaseCurrency"]) + " €")
+                        with prev2:
+                            st.metric("Total + com. + imp. (EUR)", _fmt_prev(_prev["totalWithComissionBaseCurrency"]) + " €")
+                    else:
+                        prev1, prev2, prev3, prev4 = st.columns(4)
+                        with prev1:
+                            st.metric(f"Total ({position_currency})", _fmt_prev(_prev["total"]))
+                        with prev2:
+                            st.metric(
+                                f"Total + com. + imp. ({position_currency})",
+                                _fmt_prev(_prev["totalWithComission"]),
+                            )
+                        with prev3:
+                            st.metric("Total (EUR)", _fmt_prev(_prev["totalBaseCurrency"]) + " €")
+                        with prev4:
+                            st.metric(
+                                "Total + com. + imp. (EUR)",
+                                _fmt_prev(_prev["totalWithComissionBaseCurrency"]) + " €",
+                            )
 
                     if st.button("Guardar operación", type="primary", key="guardar_nuevo"):
                         if not es_posicion_nueva and (not sel_pos or sel_pos == "—— Elige posición ——"):
@@ -2931,6 +3727,7 @@ def main() -> None:
                                 str(position_currency or "EUR"),
                                 str(op_commission_ccy or ""),
                                 str(op_taxes_ccy or ""),
+                                tipo=str(op_type or ""),
                             )
                             total_local = recalc["total"]
                             total_base = recalc["totalBaseCurrency"]
@@ -3002,6 +3799,8 @@ def main() -> None:
                                     load_data.clear()
                                 if "nuevo_form_abierto" in st.session_state:
                                     st.session_state["nuevo_form_abierto"] = False
+                                _clear_form_nueva_operacion()
+                                st.success("Operación guardada.")
                                 st.rerun()
                             except Exception as e:
                                 st.error(f"Error al guardar: {e}")
@@ -3034,7 +3833,7 @@ def main() -> None:
 
             col_filtro, col_refresh = st.columns([4, 1])
             with col_filtro:
-                filtro_origen = st.radio("Origen", ["Todos", "Acciones", "ETFs", "Fondos", "Criptos"], index=0, horizontal=True)
+                filtro_origen = st.radio("Origen", ["Todos", "Acciones", "ETFs", "Otros", "Fondos", "Criptos"], index=0, horizontal=True)
             with col_refresh:
                 st.caption("")
                 if st.button("🔄 Refrescar datos", key="btn_refresh_mov", help="Recarga movimientos desde la base de datos (útil tras actualizar nombres con scripts externos)"):
@@ -3049,6 +3848,9 @@ def main() -> None:
             elif filtro_origen == "ETFs":
                 pt = mov["positionType"].astype(str).str.strip().str.lower() if "positionType" in mov.columns else pd.Series([""] * len(mov))
                 mov = mov[(mov["origen"] == "Acciones") & (pt == "etf")].copy()
+            elif filtro_origen == "Otros":
+                pt = mov["positionType"].astype(str).str.strip().str.lower() if "positionType" in mov.columns else pd.Series([""] * len(mov))
+                mov = mov[(mov["origen"] == "Acciones") & (pt == "warrant")].copy()
             elif filtro_origen == "Fondos":
                 mov = mov[mov["origen"] == "Fondos"].copy()
             elif filtro_origen == "Criptos":
@@ -3198,7 +4000,7 @@ def main() -> None:
                         if o == "Criptos":
                             return "movimientos_criptos"
                         return "movimientos"
-                    tabla_por_filtro = {"Acciones": "movimientos", "ETFs": "movimientos", "Fondos": "movimientos_fondos", "Criptos": "movimientos_criptos"}
+                    tabla_por_filtro = {"Acciones": "movimientos", "ETFs": "movimientos", "Otros": "movimientos", "Fondos": "movimientos_fondos", "Criptos": "movimientos_criptos"}
                     if st.button("Guardar cambios", type="primary", key="btn_guardar_mov_edit"):
                         try:
                             with _get_db() as conn:
@@ -3221,7 +4023,8 @@ def main() -> None:
                                     pos_ccy = str(row_dict.get("positionCurrency", "") or "EUR").strip()
                                     comm_ccy = str(row_dict.get("comissionCurrency", "") or "").strip()
                                     tax_ccy = str(row_dict.get("taxesCurrency", "") or "").strip()
-                                    recalc = _recalc_totals(qty, price, comm, tax, fx, pos_ccy, comm_ccy, tax_ccy)
+                                    row_tipo = str(row.get("type", row_dict.get("type", "")) or "").strip().lower()
+                                    recalc = _recalc_totals(qty, price, comm, tax, fx, pos_ccy, comm_ccy, tax_ccy, tipo=row_tipo)
                                     row_dict["total"] = recalc["total"]
                                     row_dict["totalBaseCurrency"] = recalc["totalBaseCurrency"]
                                     row_dict["totalWithComission"] = recalc["totalWithComission"]
@@ -3325,41 +4128,85 @@ def main() -> None:
                     with col_tit:
                         div_position_number = st.text_input("Número de títulos", placeholder="0", key="div_position_number")
 
-                    div_currency = st.selectbox("Divisa", ["EUR", "USD", "GBP", "CAD", "DKK", "HKD", "JPY", "CHF"], key="div_currency")
+                    _div_ccy = (div_ccy or "EUR").strip().upper()
+                    _div_currencies = ["EUR", "USD", "GBP", "CAD", "DKK", "HKD", "JPY", "CHF"]
+                    _div_cur_idx = _div_currencies.index(_div_ccy) if _div_ccy in _div_currencies else 0
+                    div_currency = st.selectbox("Divisa", _div_currencies, index=_div_cur_idx, key="div_currency")
+                    div_ccy_sel = (div_currency or "EUR").strip()
+
                     use_total_bruto = st.toggle("Introducir TOTAL bruto en lugar de cantidad por título", value=False, key="div_use_total")
                     col_cant, col_com = st.columns(2)
                     with col_cant:
                         if use_total_bruto:
-                            _total_str = st.text_input("Total bruto (divisa)", placeholder="0,00", key="div_total_bruto")
+                            _total_str = st.text_input(f"Total bruto ({div_ccy_sel})", placeholder="0,00", key="div_total_bruto")
                             div_total_val = _to_float(_total_str, 0.0)
                             div_quantity_val = (div_total_val / _to_float(div_position_number, 1.0)) if _to_float(div_position_number, 0.0) else 0.0
                         else:
-                            _cant_str = st.text_input("Cantidad bruta por título (" + (div_currency or "EUR") + ")", placeholder="0,00", key="div_cantidad_titulo")
+                            _cant_str = st.text_input(f"Cantidad bruta por título ({div_ccy_sel})", placeholder="0,00", key="div_cantidad_titulo")
                             div_quantity_val = _to_float(_cant_str, 0.0)
                             div_total_val = div_quantity_val * _to_float(div_position_number, 0.0)
                     with col_com:
-                        _com_str = st.text_input("Comisión (€)", value="0", placeholder="0", key="div_comision")
-                        div_comision_eur = _to_float(_com_str, 0.0)
+                        _com_label = f"Comisión ({div_ccy_sel})" if div_ccy_sel != "EUR" else "Comisión (EUR)"
+                        _com_str = st.text_input(_com_label, value="0", placeholder="0", key="div_comision")
+                        div_comision_ccy = _to_float(_com_str, 0.0)
 
                     div_exchange_rate = 1.0
-                    if (div_currency or "EUR") != "EUR":
-                        _fx_str = st.text_input("Tipo de cambio (a EUR)", placeholder="0,85", key="div_fx")
-                        div_exchange_rate = _to_float(_fx_str, 1.0) if (_fx_str or "").strip() else 1.0
-                    if (div_currency or "EUR") == "EUR":
-                        div_total_base_val = div_total_val
-                    else:
-                        div_total_base_val = div_total_val * div_exchange_rate
+                    if div_ccy_sel != "EUR":
+                        mod_fx_div = st.toggle("Modificar tipo de cambio", value=False, key="div_mod_fx", help="Desactivado: se usa el tipo de cambio de cierre del día. Activado: puedes indicar o buscar el tipo de cambio.")
+                        if not mod_fx_div:
+                            div_exchange_rate = get_fx_rate_for_date(div_ccy_sel, div_date)
+                            if math.isnan(div_exchange_rate) or div_exchange_rate <= 0:
+                                div_exchange_rate = 1.0
+                            st.caption(f"Tipo de cambio de cierre del día: **{div_exchange_rate:.4f}** {div_ccy_sel}/EUR. Activa el switch para indicar otro valor.")
+                        else:
+                            if "div_fx_pending" in st.session_state:
+                                st.session_state["div_fx"] = str(st.session_state["div_fx_pending"]).replace(".", ",")
+                                del st.session_state["div_fx_pending"]
+                            col_fx, col_btn1, col_btn2 = st.columns([2, 1, 1])
+                            with col_fx:
+                                _fx_str = st.text_input(
+                                    f"Tipo de cambio ({div_ccy_sel}/EUR)",
+                                    placeholder="0,92",
+                                    help=f"Ej: 0,92 significa 1 {div_ccy_sel} = 0,92 EUR",
+                                    key="div_fx",
+                                )
+                                div_exchange_rate = _to_float(_fx_str, 1.0) if (_fx_str or "").strip() else 1.0
+                            with col_btn1:
+                                st.caption("")
+                                if st.button("Cierre del día", key="btn_div_fx_cierre", help="Obtener tipo de cambio de cierre para la fecha de pago (Yahoo Finance)"):
+                                    rate = get_fx_rate_for_date(div_ccy_sel, div_date)
+                                    if not math.isnan(rate) and rate > 0:
+                                        st.session_state["div_fx_pending"] = rate
+                                        st.rerun()
+                                    else:
+                                        st.warning("No se pudo obtener el tipo de cambio. Introduce el valor a mano.")
+                            with col_btn2:
+                                st.caption("")
+                                if st.button("A la hora de pago", key="btn_div_fx_intra", help="Obtener tipo de cambio aproximado en el momento del cobro (Yahoo Finance)"):
+                                    _hora_txt = div_time.strftime("%H:%M:%S") if hasattr(div_time, "strftime") else (str(div_time).strip() if div_time else "22:00:00")
+                                    dt_txt = f"{div_date.strftime('%Y-%m-%d')} {_hora_txt}"
+                                    rate = get_fx_rate_at_datetime(div_ccy_sel, dt_txt)
+                                    if not math.isnan(rate) and rate > 0:
+                                        st.session_state["div_fx_pending"] = rate
+                                        st.rerun()
+                                    else:
+                                        st.warning("No se pudo obtener el tipo de cambio intradía. Prueba con cierre del día o introduce el valor a mano.")
+                    div_comision_eur = div_comision_ccy if div_ccy_sel == "EUR" else div_comision_ccy * div_exchange_rate
+                    div_total_base_val = div_total_val if div_ccy_sel == "EUR" else div_total_val * div_exchange_rate
 
                     st.markdown("**Retenciones**")
-                    mod_ret_origen = st.toggle("Modificar la retención en origen", value=True, key="div_mod_ret_origen")
+                    mod_ret_origen = st.toggle("Modificar la retención en origen", value=False, key="div_mod_ret_origen")
+                    div_origin_ret_ccy = 0.0
                     div_origin_ret_eur = 0.0
                     if mod_ret_origen:
-                        div_origin_ret_eur = _to_float(st.text_input("Retención en origen (€)", placeholder="0,00", key="div_origin_ret_eur"), 0.0)
-                    mod_ret_destino = st.toggle("Modificar la retención en destino", value=get_broker_retiene_en_destino(div_broker or ""), key="div_mod_ret_destino", help="Si la cuenta tiene 'Retiene en destino' activado (ficha de cuenta), suele ser Sí.")
+                        _ret_origen_label = f"Retención en origen ({div_ccy_sel})" if div_ccy_sel != "EUR" else "Retención en origen (EUR)"
+                        div_origin_ret_ccy = _to_float(st.text_input(_ret_origen_label, placeholder="0,00", key="div_origin_ret_eur"), 0.0)
+                        div_origin_ret_eur = div_origin_ret_ccy if div_ccy_sel == "EUR" else div_origin_ret_ccy * div_exchange_rate
+                    mod_ret_destino = st.toggle("Modificar la retención en destino", value=False, key="div_mod_ret_destino", help="Si la cuenta tiene 'Retiene en destino' activado (ficha de cuenta), suele ser Sí.")
                     div_dest_ret_eur = 0.0
                     if mod_ret_destino:
-                        div_dest_ret_eur = _to_float(st.text_input("Retención en destino (€)", placeholder="0,00", key="div_dest_ret_eur"), 0.0)
-                    mod_pct_recup = st.toggle("Modificar % recuperable por doble imposición", value=True, key="div_mod_pct_recup")
+                        div_dest_ret_eur = _to_float(st.text_input("Retención en destino (EUR)", placeholder="0,00", key="div_dest_ret_eur"), 0.0)
+                    mod_pct_recup = st.toggle("Modificar % recuperable por doble imposición (15% por defecto)", value=False, key="div_mod_pct_recup")
                     div_pct_recup = 15
                     if mod_pct_recup:
                         div_pct_recup = _to_float(st.text_input("Porcentaje (%)", value="15", placeholder="15", key="div_pct_recup"), 15.0)
@@ -3371,15 +4218,24 @@ def main() -> None:
                     ret_origen_eur = div_origin_ret_eur
                     ret_dest_eur = div_dest_ret_eur
                     total_neto_eur = total_bruto_eur - ret_origen_eur - ret_dest_eur - div_comision_eur
+                    _dest_ret_ccy = div_dest_ret_eur / div_exchange_rate if div_exchange_rate and div_ccy_sel != "EUR" else div_dest_ret_eur
+                    total_neto_ccy = div_total_val - div_origin_ret_ccy - _dest_ret_ccy
+                    def _fmt_prev(val_eur, val_ccy=None):
+                        eur_str = f"{val_eur:,.2f}".replace(",", " ").replace(".", ",") + " €" if val_eur else "–"
+                        if div_ccy_sel == "EUR" or val_ccy is None:
+                            return eur_str
+                        ccy_str = f"{val_ccy:,.2f}".replace(",", " ").replace(".", ",") + " " + div_ccy_sel if val_ccy is not None else "–"
+                        eur_str_full = f"{val_eur:,.2f}".replace(",", " ").replace(".", ",") + " €" if val_eur is not None else "–"
+                        return f"{ccy_str} ({eur_str_full})"
                     prev1, prev2, prev3, prev4 = st.columns(4)
                     with prev1:
-                        st.metric("Total bruto (€)", f"{total_bruto_eur:,.2f}".replace(",", " ").replace(".", ",") + " €" if total_bruto_eur else "–")
+                        st.metric("Total bruto (€)", _fmt_prev(total_bruto_eur, div_total_val if div_ccy_sel != "EUR" else None))
                     with prev2:
-                        st.metric("Retención en origen (€)", f"{ret_origen_eur:,.2f}".replace(",", " ").replace(".", ",") + " €" if ret_origen_eur else "–")
+                        st.metric("Retención en origen (€)", _fmt_prev(ret_origen_eur, div_origin_ret_ccy if div_ccy_sel != "EUR" else None))
                     with prev3:
                         st.metric("Retención en dest. realizada (€)", f"{ret_dest_eur:,.2f}".replace(",", " ").replace(".", ",") + " €" if ret_dest_eur else "–")
                     with prev4:
-                        st.metric("Total neto cobrado (€)", f"{total_neto_eur:,.2f}".replace(",", " ").replace(".", ",") + " €" if total_neto_eur else "–")
+                        st.metric("Total neto cobrado (€)", _fmt_prev(total_neto_eur, total_neto_ccy if div_ccy_sel != "EUR" else None))
 
                     col_btn1, col_btn2, _ = st.columns([1, 1, 2])
                     with col_btn1:
@@ -3401,9 +4257,9 @@ def main() -> None:
                                     _t = f"{parts[0].zfill(2)}:{parts[1].zfill(2)}:00" if len(parts) >= 2 else _t
                                 time_str = _t if _t else "22:00:00"
                             date_str = div_date.strftime("%Y-%m-%d") if hasattr(div_date, "strftime") else str(div_date)
-                            neto_base = total_bruto_eur - ret_origen_eur
-                            origin_ret_ccy = div_origin_ret_eur / div_exchange_rate if div_exchange_rate and (div_ccy or "EUR") != "EUR" else div_origin_ret_eur
-                            dest_ret_ccy = ret_dest_eur / div_exchange_rate if div_exchange_rate and (div_ccy or "EUR") != "EUR" else ret_dest_eur
+                            neto_base = total_bruto_eur - div_origin_ret_eur
+                            origin_ret_ccy = div_origin_ret_ccy
+                            dest_ret_ccy = div_dest_ret_eur / div_exchange_rate if div_exchange_rate and div_ccy_sel != "EUR" else div_dest_ret_eur
                             total_neto_ccy = div_total_val - origin_ret_ccy - dest_ret_ccy
                             row_div = {
                                 "type": "stockDividend",
@@ -3497,16 +4353,89 @@ def main() -> None:
                     show_div["Total neto con devolución (€)"] = [_fmt_div_currency(_to_float_div(div_df["netoWithReturnBaseCurrency"].iloc[i]) if "netoWithReturnBaseCurrency" in div_df.columns else 0, "EUR") for i in range(len(div_df))]
                     show_div["Retención no recuperada (€)"] = [_fmt_div_currency(_to_float_div(div_df["originRetentionLossBaseCurrency"].iloc[i]) if "originRetentionLossBaseCurrency" in div_df.columns else 0, "EUR") for i in range(len(div_df))]
                     show_div["AutoFx"] = div_df.get("autoFx", pd.Series(["No"] * len(div_df))).astype(str)
-                    st.dataframe(show_div, use_container_width=True)
+
+                    habilitar_edicion_div = st.checkbox("Habilitar edición de dividendos", key="habilitar_edicion_div")
+                    puede_editar_div = habilitar_edicion_div and "_rowid_" in div_df.columns
+
+                    if puede_editar_div:
+                        edit_cols_div = ["_rowid_"] + [c for c in DIVIDENDOS_COLUMNS if c in div_df.columns]
+                        edit_df_div = div_df[edit_cols_div].copy()
+                        st.session_state["div_original"] = edit_df_div.copy()
+                        edited_div = st.data_editor(
+                            edit_df_div,
+                            num_rows="fixed",
+                            use_container_width=True,
+                            key="editor_dividendos",
+                            disabled=["_rowid_"],
+                        )
+                        try:
+                            orig_div = st.session_state["div_original"]
+                            has_changes_div = not edited_div.astype(str).fillna("").equals(orig_div.astype(str).fillna(""))
+                        except Exception:
+                            has_changes_div = False
+                        if has_changes_div and st.button("Guardar cambios en dividendos", type="primary", key="btn_guardar_div_edit"):
+                            try:
+                                for _, row in edited_div.iterrows():
+                                    row_id = int(row["_rowid_"])
+                                    row_dict = {c: row.get(c, "") for c in DIVIDENDOS_COLUMNS if c in edited_div.columns}
+                                    update_dividendo(row_id, row_dict)
+                                del st.session_state["div_original"]
+                                st.success("Cambios guardados correctamente.")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Error al guardar: {e}")
+                    else:
+                        st.dataframe(show_div, use_container_width=True)
+
+                    st.subheader("Eliminar dividendos")
+                    def _etiqueta_div(i: int) -> str:
+                        r = div_df.iloc[i]
+                        fecha = str(r.get("date", "")) + " " + str(r.get("time", ""))[:8]
+                        ticker = str(r.get("ticker", r.get("ticker_Yahoo", "")))
+                        broker = str(r.get("broker", ""))
+                        total = r.get("totalBaseCurrency", r.get("total", ""))
+                        return f"{fecha} | {ticker} | {broker} | {total} €"
+
+                    opciones_div = list(range(len(div_df)))
+                    eliminar_div = st.multiselect(
+                        "Selecciona los dividendos a eliminar",
+                        opciones_div,
+                        format_func=_etiqueta_div,
+                        key="eliminar_dividendos",
+                    )
+                    if eliminar_div and st.button("Eliminar dividendos seleccionados", type="primary", key="btn_eliminar_div"):
+                        rowids_to_del = [int(div_df.iloc[pos]["_rowid_"]) for pos in eliminar_div if 0 <= pos < len(div_df)]
+                        n = delete_dividendos_by_rowids(rowids_to_del)
+                        st.success(f"Eliminados {n} dividendo(s).")
+                        st.rerun()
         return
 
     if vista == "Fiscalidad":
+        st.header("Fiscalidad")
+
+        def _to_float_div(x, default=0.0):
+            if x is None or (isinstance(x, float) and pd.isna(x)) or str(x).strip() == "":
+                return default
+            try:
+                return float(str(x).replace(",", ".").strip())
+            except (ValueError, TypeError):
+                return default
+
+        # --- Selector de ejercicio ---
+        anio_actual = datetime.now().year
+        ejercicios = [anio_actual, anio_actual - 1]
+        ejercicio = st.radio("Ejercicio", ejercicios, format_func=lambda x: f"Ejercicio {x}", horizontal=True, key="fisc_ejercicio")
+
+        # --- Cargar datos FIFO ---
         df_fondos_fisc = load_data_fondos()
         df_crip_fisc = load_data_criptos()
 
         lots_df, sales_df = compute_fifo_all(df)
         lots_fondos, sales_fondos = compute_fifo_fondos(df_fondos_fisc)
         lots_crip, sales_crip = compute_fifo_criptos(df_crip_fisc)
+
+        if not sales_crip.empty and "Retención dest. (€)" not in sales_crip.columns:
+            sales_crip["Retención dest. (€)"] = 0.0
 
         if not lots_fondos.empty:
             lots_df = pd.concat([lots_df, lots_fondos], ignore_index=True) if not lots_df.empty else lots_fondos
@@ -3517,210 +4446,218 @@ def main() -> None:
         if not sales_crip.empty:
             sales_df = pd.concat([sales_df, sales_crip], ignore_index=True) if not sales_df.empty else sales_crip
 
-        # --- Filtros fiscalidad (en la página, no en el menú) ---
-        st.subheader("Filtros fiscalidad")
-        tickers_fisc = sorted(
-            set(
-                list(lots_df.get("Ticker", pd.Series(dtype=str)).dropna().unique())
-                + list(sales_df.get("Ticker", pd.Series(dtype=str)).dropna().unique())
-            )
-        )
-        brokers_fisc = sorted(
-            set(
-                list(lots_df.get("Broker", pd.Series(dtype=str)).dropna().unique())
-                + list(sales_df.get("Broker", pd.Series(dtype=str)).dropna().unique())
-            )
-        )
-        tipo_options_fisc = ["Todos", "Acciones", "ETFs"]
-        if not lots_fondos.empty or not sales_fondos.empty:
-            tipo_options_fisc.append("Fondos")
-        if not lots_crip.empty or not sales_crip.empty:
-            tipo_options_fisc.append("Criptos")
+        if not sales_df.empty and "Retención dest. (€)" not in sales_df.columns:
+            sales_df["Retención dest. (€)"] = 0.0
 
-        col_t, col_b, col_tipo, col_d = st.columns(4)
-        with col_t:
-            sel_tickers = st.multiselect("Ticker", tickers_fisc, default=tickers_fisc)
-        with col_b:
-            sel_brokers = st.multiselect("Broker", brokers_fisc, default=brokers_fisc)
-        with col_tipo:
-            sel_tipo_activo = st.radio(
-                "Tipo de activo",
-                options=tipo_options_fisc,
-                index=0,
-            )
-        with col_d:
-            min_date = pd.to_datetime(
-                sales_df["Fecha venta"], errors="coerce"
-            ).min() if not sales_df.empty else None
-            max_date = pd.to_datetime(
-                sales_df["Fecha venta"], errors="coerce"
-            ).max() if not sales_df.empty else None
-            if min_date is not None and max_date is not None:
-                start_date, end_date = st.date_input(
-                    "Rango fechas ventas",
-                    [min_date.date(), max_date.date()],
-                )
-            else:
-                start_date, end_date = None, None
+        # Filtrar ventas por ejercicio
+        sales_ejercicio = sales_df.copy()
+        if not sales_ejercicio.empty and "Fecha venta" in sales_ejercicio.columns:
+            fechas = pd.to_datetime(sales_ejercicio["Fecha venta"], errors="coerce")
+            sales_ejercicio = sales_ejercicio[fechas.dt.year == ejercicio].copy()
 
-        # Aplicamos filtros
-        if not lots_df.empty:
-            mask = lots_df["Ticker"].isin(sel_tickers) & lots_df["Broker"].isin(sel_brokers)
-            if "Tipo activo" in lots_df.columns and sel_tipo_activo != "Todos":
-                tipos = lots_df["Tipo activo"].astype(str).str.strip().str.lower()
-                if sel_tipo_activo == "Acciones":
-                    mask &= (tipos == "stock") | ((tipos != "etf") & (tipos != "fund") & (tipos != "crypto") & (tipos != "") & (tipos != "nan"))
-                elif sel_tipo_activo == "ETFs":
-                    mask &= tipos == "etf"
-                elif sel_tipo_activo == "Fondos":
-                    mask &= tipos == "fund"
-                elif sel_tipo_activo == "Criptos":
-                    mask &= tipos == "crypto"
-            lots_df = lots_df[mask]
+        # --- Resumen fiscal (tarjetas) ---
+        g_p_brutas = sales_ejercicio["Plusvalía / Minusvalía (€)"].sum() if not sales_ejercicio.empty and "Plusvalía / Minusvalía (€)" in sales_ejercicio.columns else 0.0
 
-        if not sales_df.empty:
-            mask_s = sales_df["Ticker"].isin(sel_tickers) & sales_df["Broker"].isin(sel_brokers)
-            if "Tipo activo" in sales_df.columns and sel_tipo_activo != "Todos":
-                tipos_s = sales_df["Tipo activo"].astype(str).str.strip().str.lower()
-                if sel_tipo_activo == "Acciones":
-                    mask_s &= (tipos_s == "stock") | ((tipos_s != "etf") & (tipos_s != "fund") & (tipos_s != "crypto") & (tipos_s != "") & (tipos_s != "nan"))
-                elif sel_tipo_activo == "ETFs":
-                    mask_s &= tipos_s == "etf"
-                elif sel_tipo_activo == "Fondos":
-                    mask_s &= tipos_s == "fund"
-                elif sel_tipo_activo == "Criptos":
-                    mask_s &= tipos_s == "crypto"
-            sales_df = sales_df[mask_s]
-            if start_date is not None and end_date is not None:
-                fechas = pd.to_datetime(sales_df["Fecha venta"], errors="coerce")
-                mask_fecha = (fechas >= pd.to_datetime(start_date)) & (
-                    fechas <= pd.to_datetime(end_date)
-                )
-                sales_df = sales_df[mask_fecha]
-
-        # --- Posiciones vivas ---
-        st.header("Posiciones vivas (FIFO por lotes)")
-        if lots_df.empty:
-            st.info("No hay lotes vivos con los filtros seleccionados.")
-        else:
-            lots_df = lots_df.sort_values(["Broker", "Ticker", "Fecha origen"])
-            lots_df = lots_df.reset_index()
-            if "index" in lots_df.columns:
-                if "Ticker" not in lots_df.columns:
-                    lots_df = lots_df.rename(columns={"index": "Ticker"})
-                else:
-                    lots_df = lots_df.drop(columns=["index"])
-            if "ticker" in lots_df.columns and "Ticker" not in lots_df.columns:
-                lots_df = lots_df.rename(columns={"ticker": "Ticker"})
-            for old, new in [("ticker", "Ticker"), ("broker", "Broker"), ("nombre", "Nombre")]:
-                if old in lots_df.columns and new not in lots_df.columns:
-                    lots_df = lots_df.rename(columns={old: new})
-            if "Nombre" in lots_df.columns and "Ticker" in lots_df.columns and "Tipo activo" in lots_df.columns:
-                mask_c = lots_df["Tipo activo"].astype(str).str.strip().str.lower() == "crypto"
-                lots_df.loc[mask_c, "Nombre"] = lots_df.loc[mask_c, "Ticker"]
-
-            col_order = [c for c in ["Ticker", "Broker", "Nombre", "Fecha origen", "Cantidad", "Precio medio €", "Tipo activo"] if c in lots_df.columns]
-            st.dataframe(
-                lots_df,
-                use_container_width=True,
-                column_order=col_order,
-            )
-
-        # --- Ventas ---
-        st.header("Ventas (impacto fiscal FIFO)")
-        if sales_df.empty:
-            st.info("No hay ventas registradas con los filtros seleccionados.")
-        else:
-            sales_df = sales_df.sort_values(["Fecha venta", "Broker", "Ticker"])
-            sales_df = sales_df.reset_index()
-            if "index" in sales_df.columns:
-                if "Ticker" not in sales_df.columns:
-                    sales_df = sales_df.rename(columns={"index": "Ticker"})
-                else:
-                    sales_df = sales_df.drop(columns=["index"])
-            if "ticker" in sales_df.columns and "Ticker" not in sales_df.columns:
-                sales_df = sales_df.rename(columns={"ticker": "Ticker"})
-            if "Nombre" in sales_df.columns and "Ticker" in sales_df.columns and "Tipo activo" in sales_df.columns:
-                mask_c = sales_df["Tipo activo"].astype(str).str.strip().str.lower() == "crypto"
-                sales_df.loc[mask_c, "Nombre"] = sales_df.loc[mask_c, "Ticker"]
-
-            col_order_sales = [c for c in ["Ticker", "Broker", "Nombre", "Fecha venta", "Cantidad vendida", "Valor compra histórico (€)", "Valor venta (€)", "Plusvalía / Minusvalía (€)", "Tipo activo"] if c in sales_df.columns]
-            st.dataframe(
-                sales_df,
-                use_container_width=True,
-                column_order=col_order_sales,
-            )
-            total_pnl = sales_df["Plusvalía / Minusvalía (€)"].sum()
-            st.write(f"**Plusvalía/Minusvalía total**: {fmt_eur(total_pnl)}")
-
-        # --- Dividendos (resumen fiscal por año) ---
-        st.header("Dividendos (resumen fiscal por año)")
         div_df = load_dividendos()
-        if div_df.empty:
-            st.info("No hay dividendos registrados.")
-        else:
-            def _to_float_div(x, default=0.0):
-                if x is None or (isinstance(x, float) and pd.isna(x)) or str(x).strip() == "":
-                    return default
-                try:
-                    return float(str(x).replace(",", ".").strip())
-                except (ValueError, TypeError):
-                    return default
-
+        div_ejercicio = pd.DataFrame()
+        if not div_df.empty:
             div_df = div_df.copy()
             div_df["year"] = pd.to_datetime(div_df["date"], errors="coerce").dt.year
-            div_df = div_df.dropna(subset=["year"])
-            div_df["base_imponible"] = div_df["totalBaseCurrency"].apply(lambda x: _to_float_div(x, 0.0))
-            div_df["retencion_origen_eur"] = (
-                div_df["totalBaseCurrency"].apply(lambda x: _to_float_div(x, 0.0))
-                - div_df["netoBaseCurrency"].apply(lambda x: _to_float_div(x, 0.0))
-            )
-            div_df["retencion_destino"] = div_df["destinationRetentionBaseCurrency"].apply(
-                lambda x: _to_float_div(x, 0.0)
-            )
+            div_ejercicio = div_df[div_df["year"] == ejercicio].copy()
 
-            resumen = (
-                div_df.groupby("year", as_index=False)
-                .agg(
-                    base_imponible=("base_imponible", "sum"),
-                    retencion_origen=("retencion_origen_eur", "sum"),
-                    retencion_destino=("retencion_destino", "sum"),
-                    num_dividendos=("year", "count"),
-                )
-                .rename(
-                    columns={
-                        "year": "Año",
-                        "base_imponible": "Base imponible (€)",
-                        "retencion_origen": "Retención origen (€)",
-                        "retencion_destino": "Retención destino (€)",
-                        "num_dividendos": "Nº dividendos",
-                    }
-                )
-            )
-            resumen["Total retenciones (€)"] = (
-                resumen["Retención origen (€)"] + resumen["Retención destino (€)"]
-            )
-            resumen = resumen.sort_values("Año", ascending=False)
+        total_dividendos_bruto = div_ejercicio["totalBaseCurrency"].apply(lambda x: _to_float_div(x, 0.0)).sum() if not div_ejercicio.empty else 0.0
+        retencion_origen_div = 0.0
+        retencion_destino_div = 0.0
+        if not div_ejercicio.empty:
+            for _, r in div_ejercicio.iterrows():
+                total_b = _to_float_div(r.get("totalBaseCurrency"), 0.0)
+                neto_b = _to_float_div(r.get("netoBaseCurrency"), 0.0)
+                retencion_origen_div += total_b - neto_b
+                retencion_destino_div += _to_float_div(r.get("destinationRetentionBaseCurrency"), 0.0)
+        total_neto_dividendos = div_ejercicio["totalNetoBaseCurrency"].apply(lambda x: _to_float_div(x, 0.0)).sum() if not div_ejercicio.empty and "totalNetoBaseCurrency" in div_ejercicio.columns else (total_dividendos_bruto - retencion_origen_div - retencion_destino_div)
 
-            if resumen.empty:
-                st.info("No hay dividendos con fecha válida para agrupar por año.")
+        # Comisiones: de movimientos y dividendos del ejercicio
+        df_all = df.copy()
+        if not df_fondos_fisc.empty:
+            df_all = pd.concat([df_all, df_fondos_fisc], ignore_index=True)
+        if not df_crip_fisc.empty:
+            df_all = pd.concat([df_all, df_crip_fisc], ignore_index=True)
+        df_all["year"] = pd.to_datetime(df_all["date"], errors="coerce").dt.year
+        df_ejercicio = df_all[df_all["year"] == ejercicio] if "year" in df_all.columns else df_all
+        comisiones_mov = df_ejercicio["comission"].apply(lambda x: _to_float_div(x, 0.0)).sum() if not df_ejercicio.empty and "comission" in df_ejercicio.columns else 0.0
+        comisiones_div = div_ejercicio["comission"].apply(lambda x: _to_float_div(x, 0.0)).sum() if not div_ejercicio.empty and "comission" in div_ejercicio.columns else 0.0
+        if not div_ejercicio.empty and "comissionBaseCurrency" in div_ejercicio.columns:
+            comisiones_div = div_ejercicio["comissionBaseCurrency"].apply(lambda x: _to_float_div(x, 0.0)).sum()
+        total_comisiones = comisiones_mov + comisiones_div
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("Resumen fiscal")
+            st.metric("G/P realizadas brutas (€)", fmt_eur(g_p_brutas))
+            st.metric("Dividendos cobrados brutos (€)", fmt_eur(total_dividendos_bruto))
+            st.metric("Total neto dividendos (€)", fmt_eur(total_neto_dividendos))
+            st.metric("Comisiones (€)", fmt_eur(total_comisiones))
+        with col2:
+            st.subheader("Dividendos y cupones")
+            st.caption("Total bruto (€)")
+            st.write(fmt_eur(total_dividendos_bruto))
+            st.caption("Retenciones origen (€)")
+            st.write(fmt_eur(retencion_origen_div))
+            st.caption("Retenciones destino (€)")
+            st.write(fmt_eur(retencion_destino_div))
+            st.caption("Total neto cobrado (€)")
+            st.write(fmt_eur(total_neto_dividendos))
+
+        # --- Tabs ---
+        tab_resumen, tab_gp_tipo, tab_gp_activo, tab_div_pos = st.tabs([
+            "G/P por tipo de posición",
+            "G/P por activo",
+            "Dividendos por posición",
+            "Posiciones vivas / Ventas (detalle)",
+        ])
+
+        # Mapeo tipo activo → etiqueta
+        def _tipo_label(t):
+            t = str(t or "").strip().lower()
+            if t == "stock": return "Valores"
+            if t == "etf": return "ETFs"
+            if t == "fund": return "Fondos"
+            if t == "crypto": return "Cripto"
+            if t == "warrant": return "Otros"
+            return "Valores" if t else "Otros"
+
+        with tab_resumen:
+            st.subheader("G/P realizadas por tipo de posición")
+            if sales_ejercicio.empty:
+                st.info("No hay ventas en este ejercicio.")
             else:
+                sales_tipo = sales_ejercicio.copy()
+                sales_tipo["Tipo"] = sales_tipo["Tipo activo"].apply(_tipo_label)
+                agg_dict = {
+                    "total_recibido": ("Valor venta (€)", "sum"),
+                    "coste_total": ("Valor compra histórico (€)", "sum"),
+                    "ganancia_perdida": ("Plusvalía / Minusvalía (€)", "sum"),
+                }
+                if "Retención dest. (€)" in sales_tipo.columns:
+                    agg_dict["retencion_dest"] = ("Retención dest. (€)", "sum")
+                agg = sales_tipo.groupby("Tipo", as_index=False).agg(**agg_dict)
+                agg = agg.rename(columns={
+                    "total_recibido": "Total recibido con comisión (€)",
+                    "coste_total": "Coste total con com. e imp. (€)",
+                    "ganancia_perdida": "Ganancia/Pérd. con comisión (€)",
+                    "retencion_dest": "Rtción. en dest. realz. (€)",
+                })
+                if "Rtción. en dest. realz. (€)" not in agg.columns:
+                    agg["Rtción. en dest. realz. (€)"] = 0.0
                 st.dataframe(
-                    resumen.style.format(
-                        {
-                            "Base imponible (€)": lambda x: fmt_eur(x),
-                            "Retención origen (€)": lambda x: fmt_eur(x),
-                            "Retención destino (€)": lambda x: fmt_eur(x),
-                            "Total retenciones (€)": lambda x: fmt_eur(x),
-                        },
-                        na_rep="-",
-                    ),
+                    agg.style.format({
+                        "Total recibido con comisión (€)": lambda x: fmt_eur(x),
+                        "Coste total con com. e imp. (€)": lambda x: fmt_eur(x),
+                        "Ganancia/Pérd. con comisión (€)": lambda x: fmt_eur(x),
+                        "Rtción. en dest. realz. (€)": lambda x: fmt_eur(x),
+                    }, na_rep="–"),
                     use_container_width=True,
                 )
-                total_base = resumen["Base imponible (€)"].sum()
-                total_ret = resumen["Total retenciones (€)"].sum()
-                st.write(f"**Total base imponible (todos los años)**: {fmt_eur(total_base)}")
-                st.write(f"**Total retenciones (todos los años)**: {fmt_eur(total_ret)}")
+
+        with tab_gp_tipo:
+            st.subheader("Ganancia/Pérdida realizada por activo")
+            if sales_ejercicio.empty:
+                st.info("No hay ventas en este ejercicio.")
+            else:
+                cols_activo = ["Ticker", "Tipo activo", "Valor compra histórico (€)", "Valor venta (€)", "Plusvalía / Minusvalía (€)"]
+                if "Retención dest. (€)" in sales_ejercicio.columns:
+                    cols_activo.append("Retención dest. (€)")
+                sales_activo = sales_ejercicio.copy()
+                sales_activo["Tipo"] = sales_activo["Tipo activo"].apply(_tipo_label)
+                agg_act_dict = {
+                    "valor_adq": ("Valor compra histórico (€)", "sum"),
+                    "valor_trans": ("Valor venta (€)", "sum"),
+                    "ganancia": ("Plusvalía / Minusvalía (€)", "sum"),
+                }
+                if "Retención dest. (€)" in sales_activo.columns:
+                    agg_act_dict["ret_dest"] = ("Retención dest. (€)", "sum")
+                agg_activo = sales_activo.groupby(["Ticker", "Tipo"], as_index=False).agg(**agg_act_dict).rename(columns={
+                    "valor_adq": "Valor adquisición (€)",
+                    "valor_trans": "Valor transmisión (€)",
+                    "ganancia": "Ganancia/Pérdida (€)",
+                    "ret_dest": "Rtción. en dest. realz. (€)",
+                })
+                if "Rtción. en dest. realz. (€)" not in agg_activo.columns:
+                    agg_activo["Rtción. en dest. realz. (€)"] = 0.0
+                agg_activo = agg_activo.sort_values("Ganancia/Pérdida (€)", ascending=False)
+                st.dataframe(
+                    agg_activo.style.format({c: lambda x: fmt_eur(x) for c in agg_activo.columns if "€" in str(c)}, na_rep="–"),
+                    use_container_width=True,
+                )
+
+        with tab_gp_activo:
+            st.subheader("Dividendos y cupones por posición")
+            if div_ejercicio.empty:
+                st.info("No hay dividendos en este ejercicio.")
+            else:
+                div_pos = div_ejercicio.copy()
+                div_pos["ticker"] = div_pos["ticker"] if "ticker" in div_pos.columns else div_pos["ticker_Yahoo"]
+                div_pos["total_bruto"] = div_pos["totalBaseCurrency"].apply(lambda x: _to_float_div(x, 0.0))
+                div_pos["impuesto_ext"] = div_pos["totalBaseCurrency"].apply(lambda x: _to_float_div(x, 0.0)) - div_pos["netoBaseCurrency"].apply(lambda x: _to_float_div(x, 0.0))
+                div_pos["total_despues_origen"] = div_pos["netoBaseCurrency"].apply(lambda x: _to_float_div(x, 0.0))
+                div_pos["ret_dest"] = div_pos["destinationRetentionBaseCurrency"].apply(lambda x: _to_float_div(x, 0.0))
+                div_pos["total_neto"] = div_pos["totalNetoBaseCurrency"].apply(lambda x: _to_float_div(x, 0.0)) if "totalNetoBaseCurrency" in div_pos.columns else (div_pos["total_despues_origen"] - div_pos["ret_dest"])
+                ret_devol = div_pos["retentionReturnedBaseCurrency"].apply(lambda x: _to_float_div(x, 0.0)) if "retentionReturnedBaseCurrency" in div_pos.columns else 0.0
+                div_pos["total_neto_devol"] = div_pos["total_neto"] + ret_devol
+
+                agg_div = div_pos.groupby("ticker", as_index=False).agg(
+                    total_bruto=("total_bruto", "sum"),
+                    impuesto_ext=("impuesto_ext", "sum"),
+                    total_despues_origen=("total_despues_origen", "sum"),
+                    ret_dest=("ret_dest", "sum"),
+                    total_neto=("total_neto", "sum"),
+                    total_neto_devol=("total_neto_devol", "sum"),
+                ).rename(columns={
+                    "ticker": "Posición",
+                    "total_bruto": "Total bruto (€)",
+                    "impuesto_ext": "Impuesto satisf. en el extranjero (€)",
+                    "total_despues_origen": "Total bruto después de origen (€)",
+                    "ret_dest": "Retención en dest. realizada (€)",
+                    "total_neto": "Total neto cobrado (€)",
+                    "total_neto_devol": "Total neto con devolución (€)",
+                })
+                # Fila TOTAL
+                fila_total = pd.DataFrame([{
+                    "Posición": "TOTAL",
+                    "Total bruto (€)": agg_div["Total bruto (€)"].sum(),
+                    "Impuesto satisf. en el extranjero (€)": agg_div["Impuesto satisf. en el extranjero (€)"].sum(),
+                    "Total bruto después de origen (€)": agg_div["Total bruto después de origen (€)"].sum(),
+                    "Retención en dest. realizada (€)": agg_div["Retención en dest. realizada (€)"].sum(),
+                    "Total neto cobrado (€)": agg_div["Total neto cobrado (€)"].sum(),
+                    "Total neto con devolución (€)": agg_div["Total neto con devolución (€)"].sum(),
+                }])
+                agg_div = pd.concat([fila_total, agg_div], ignore_index=True)
+                st.dataframe(
+                    agg_div.style.format({c: lambda x: fmt_eur(x) if isinstance(x, (int, float)) else x for c in agg_div.columns if "€" in str(c)}, na_rep="–"),
+                    use_container_width=True,
+                )
+
+        with tab_div_pos:
+            st.subheader("Posiciones vivas (FIFO por lotes)")
+            if lots_df.empty:
+                st.info("No hay lotes vivos.")
+            else:
+                lots_show = lots_df.sort_values(["Broker", "Ticker", "Fecha origen"]).copy()
+                for old, new in [("ticker", "Ticker"), ("broker", "Broker"), ("nombre", "Nombre")]:
+                    if old in lots_show.columns and new not in lots_show.columns:
+                        lots_show = lots_show.rename(columns={old: new})
+                col_order = [c for c in ["Ticker", "Broker", "Nombre", "Fecha origen", "Cantidad", "Precio medio €", "Tipo activo"] if c in lots_show.columns]
+                st.dataframe(lots_show[col_order] if col_order else lots_show, use_container_width=True)
+
+            st.subheader("Ventas (impacto fiscal FIFO)")
+            if sales_df.empty:
+                st.info("No hay ventas registradas.")
+            else:
+                sales_show = sales_df.sort_values(["Fecha venta", "Broker", "Ticker"]).copy()
+                col_order_s = [c for c in ["Ticker", "Broker", "Nombre", "Fecha venta", "Cantidad vendida", "Valor compra histórico (€)", "Valor venta (€)", "Plusvalía / Minusvalía (€)", "Retención dest. (€)", "Tipo activo"] if c in sales_show.columns]
+                st.dataframe(sales_show[col_order_s] if col_order_s else sales_show, use_container_width=True)
+                total_pnl = sales_show["Plusvalía / Minusvalía (€)"].sum() if "Plusvalía / Minusvalía (€)" in sales_show.columns else 0
+                st.write(f"**Plusvalía/Minusvalía total**: {fmt_eur(total_pnl)}")
 
         return
 
@@ -3784,7 +4721,8 @@ def main() -> None:
         return
 
     # Vista normal de cartera agregada (acciones + fondos; filtro por tipo abajo)
-    positions_acc = compute_positions(df)
+    # FIFO en ventas y traspasos para coincidir con Filios
+    positions_acc = compute_positions_fifo(df)
     positions_acc["Origen"] = "Acciones"
     df_fondos = load_data_fondos()
     positions_fondos_df = positions_fondos_to_dataframe(compute_positions_fondos(df_fondos))
@@ -3840,12 +4778,14 @@ def main() -> None:
             st.session_state["cartera_enriched"] = cached_df
             st.session_state["cartera_enriched_updated_at"] = cached_at
 
+    precios_manuales = load_precios_manuales()
+
     col_act, col_ref = st.columns([1, 1])
     with col_act:
         if st.button("Actualizar cotizaciones", type="primary"):
             with st.spinner("Obteniendo precios actuales..."):
                 st.session_state["cartera_enriched"] = enrich_with_market_data(
-                    positions_base.copy()
+                    positions_base.copy(), manual_prices=precios_manuales
                 )
                 st.session_state["cartera_enriched_updated_at"] = datetime.now().isoformat()
                 if cotiz_signature:
@@ -3862,7 +4802,17 @@ def main() -> None:
             st.session_state["cartera_enriched_updated_at"] = None
             st.rerun()
 
-    # Si las posiciones base han cambiado (nº filas o brokers/tickers), invalidamos el enriquecido
+    # Si las posiciones base han cambiado (nº filas, brokers/tickers o inversión), invalidamos el enriquecido
+    inv_changed = False
+    if (
+        st.session_state["cartera_enriched"] is not None
+        and "Inversion €" in positions_base.columns
+        and "Inversion €" in st.session_state["cartera_enriched"].columns
+        and len(st.session_state["cartera_enriched"]) == len(positions_base)
+    ):
+        ce = st.session_state["cartera_enriched"]["Inversion €"].fillna(0).round(2)
+        pb = positions_base["Inversion €"].fillna(0).round(2)
+        inv_changed = not ce.equals(pb)
     if (
         st.session_state["cartera_enriched"] is not None
         and (
@@ -3870,6 +4820,7 @@ def main() -> None:
             or set(st.session_state["cartera_enriched"]["Broker"].unique()) != set(positions_base["Broker"].unique())
             or set(st.session_state["cartera_enriched"]["Ticker_Yahoo"].unique())
             != set(positions_base["Ticker_Yahoo"].unique())
+            or inv_changed
         )
     ):
         st.session_state["cartera_enriched"] = None
@@ -3886,9 +4837,32 @@ def main() -> None:
         positions["GyP hoy €"] = math.nan
         positions["Moneda Yahoo"] = positions.get("Moneda Activo", "EUR")
         positions["Cierre Previo"] = math.nan
+        # Aplicar precios manuales si existen
+        ticker_col = "Ticker_Yahoo" if "Ticker_Yahoo" in positions.columns else "Ticker"
+        for idx, row in positions.iterrows():
+            t = str(row.get(ticker_col) or "").strip()
+            if t and t in precios_manuales:
+                positions.at[idx, "Precio Actual"] = precios_manuales[t]
+                positions.at[idx, "Valor Mercado €"] = positions.at[idx, "Titulos"] * precios_manuales[t]
+                positions.at[idx, "Plusvalia €"] = positions.at[idx, "Valor Mercado €"] - positions.at[idx, "Inversion €"]
+                inv = positions.at[idx, "Inversion €"]
+                positions.at[idx, "Plusvalia %"] = (positions.at[idx, "Plusvalia €"] / inv * 100) if inv and abs(inv) > 0 else math.nan
+                positions.at[idx, "GyP hoy %"] = math.nan
+                positions.at[idx, "GyP hoy €"] = 0.0
         st.info("Pulsa **Actualizar cotizaciones** para cargar precios actuales y valor de mercado.")
     else:
-        positions = st.session_state["cartera_enriched"]
+        positions = st.session_state["cartera_enriched"].copy()
+        # Reaplicar precios manuales por si se añadieron nuevos (p. ej. warrants sin Yahoo)
+        ticker_col = "Ticker_Yahoo" if "Ticker_Yahoo" in positions.columns else "Ticker"
+        for idx, row in positions.iterrows():
+            t = str(row.get(ticker_col) or "").strip()
+            if t and t in precios_manuales and (pd.isna(row.get("Precio Actual")) or row.get("Precio Actual") is None):
+                positions.at[idx, "Precio Actual"] = precios_manuales[t]
+                positions.at[idx, "Precio Actual €"] = precios_manuales[t]
+                positions.at[idx, "Valor Mercado €"] = positions.at[idx, "Titulos"] * precios_manuales[t]
+                positions.at[idx, "Plusvalia €"] = positions.at[idx, "Valor Mercado €"] - positions.at[idx, "Inversion €"]
+                inv = positions.at[idx, "Inversion €"]
+                positions.at[idx, "Plusvalia %"] = (positions.at[idx, "Plusvalia €"] / inv * 100) if inv and abs(inv) > 0 else math.nan
         updated_at = st.session_state.get("cartera_enriched_updated_at")
         if updated_at:
             try:
@@ -3898,6 +4872,63 @@ def main() -> None:
                 st.caption("Pulsa **Actualizar cotizaciones** para refrescar los precios.")
         else:
             st.caption("Pulsa **Actualizar cotizaciones** para refrescar los precios.")
+
+    # Expander para precios manuales (Otros/warrants sin cotización en Yahoo)
+    ticker_col_pm = "Ticker_Yahoo" if "Ticker_Yahoo" in positions.columns else "Ticker"
+    precio_col = "Precio Actual €" if "Precio Actual €" in positions.columns else "Precio Actual"
+    sin_cotiz = []
+    for idx, row in positions.iterrows():
+        t = str(row.get(ticker_col_pm) or "").strip()
+        if t and (pd.isna(row.get(precio_col)) or row.get(precio_col) is None):
+            tipo = str(row.get("Tipo activo", "") or "").strip().lower()
+            sin_cotiz.append((row.get("Broker"), t, row.get("Nombre", t), tipo))
+    if sin_cotiz:
+        with st.expander("📝 Precios manuales (posiciones sin cotización en Yahoo)", expanded=False):
+            st.caption("Introduce el precio actual en EUR para calcular valor de mercado y plusvalía.")
+            # Selector de tipo de activo
+            tipos_presentes = set()
+            for _, _, _, tipo in sin_cotiz:
+                t = (tipo or "").strip().lower()
+                if t in ("stock", "etf", "fund", "crypto", "warrant"):
+                    tipos_presentes.add(t)
+                elif t and t not in ("nan", ""):
+                    tipos_presentes.add("stock")
+            pm_tipo_options = ["Todos", "Acciones", "ETFs", "Fondos", "Criptos", "Otros"]
+            pm_tipo_sel = st.radio("Tipo de activo", options=pm_tipo_options, index=0, horizontal=True, key="pm_tipo_activo")
+            # Filtrar sin_cotiz según tipo
+            def _pm_match_tipo(tipo: str, sel: str) -> bool:
+                if sel == "Todos":
+                    return True
+                if sel == "Acciones":
+                    return tipo in ("stock", "") or tipo not in ("etf", "fund", "crypto", "warrant")
+                if sel == "ETFs":
+                    return tipo == "etf"
+                if sel == "Fondos":
+                    return tipo == "fund"
+                if sel == "Criptos":
+                    return tipo == "crypto"
+                if sel == "Otros":
+                    return tipo == "warrant"
+                return True
+            sin_cotiz_filtrado = [(b, t, n) for b, t, n, tipo in sin_cotiz if _pm_match_tipo(tipo, pm_tipo_sel)]
+            pm_updated = dict(precios_manuales)
+            for broker, ticker, nombre in sin_cotiz_filtrado:
+                key_pm = f"pm_{broker}_{ticker}".replace(" ", "_")
+                val_actual = precios_manuales.get(ticker, "")
+                nuevo = st.number_input(
+                    f"{ticker} ({nombre})",
+                    value=float(val_actual) if val_actual else 0.0,
+                    min_value=0.0,
+                    step=0.01,
+                    format="%.4f",
+                    key=key_pm,
+                )
+                if nuevo and nuevo > 0:
+                    pm_updated[ticker] = nuevo
+            if st.button("Guardar precios manuales", key="btn_guardar_pm"):
+                save_precios_manuales(pm_updated)
+                st.success("Precios guardados. Recargando…")
+                st.rerun()
 
     # Selector de broker en la página: GLOBAL a la izquierda, luego brokers ordenados
     brokers = sorted(positions["Broker"].dropna().unique().tolist())
@@ -3914,7 +4945,7 @@ def main() -> None:
     else:
         view = positions[positions["Broker"] == selected].copy()
 
-    # Selector de tipo de activo: Todos / Acciones / ETFs / Fondos / Criptos
+    # Selector de tipo de activo: Todos / Acciones / ETFs / Fondos / Criptos / Otros
     tipo_options = ["Todos", "Acciones", "ETFs"]
     if "Tipo activo" in view.columns:
         tipos_all = view["Tipo activo"].astype(str).str.strip().str.lower()
@@ -3922,6 +4953,8 @@ def main() -> None:
             tipo_options.append("Fondos")
         if (tipos_all == "crypto").any():
             tipo_options.append("Criptos")
+        if (tipos_all == "warrant").any():
+            tipo_options.append("Otros")
     tipo_sel = st.radio(
         "Tipo de activo",
         options=tipo_options,
@@ -3935,6 +4968,7 @@ def main() -> None:
                 (tipos != "etf")
                 & (tipos != "fund")
                 & (tipos != "crypto")
+                & (tipos != "warrant")
                 & (tipos != "")
                 & (tipos != "nan")
             )
@@ -3945,6 +4979,8 @@ def main() -> None:
             view = view[tipos == "fund"]
         elif tipo_sel == "Criptos":
             view = view[tipos == "crypto"]
+        elif tipo_sel == "Otros":
+            view = view[tipos == "warrant"]
 
     # Aseguramos columnas necesarias antes de agrupar
     if "Moneda Yahoo" not in view.columns:
