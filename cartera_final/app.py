@@ -1,4 +1,3 @@
-import base64
 import hashlib
 import json
 import math
@@ -19,10 +18,10 @@ import yfinance as yf
 DECIMALS_POSITION = 8
 MIN_POSITION = 10 ** -DECIMALS_POSITION
 
-# Directorio de datos (para Add-on Home Assistant: /data; en local: directorio actual)
+# Directorio de datos (Add-on HA: DATA_DIR, p. ej. /share/cartera_final; en local: directorio actual)
 _DATA_DIR = Path(os.environ.get("DATA_DIR", ".")).resolve()
 
-# Nombre del archivo de BD (acciones.db, acciones_final.db en add-on)
+# Nombre del archivo de BD (run.sh del add-on exporta DB_FILENAME=acciones_final.db)
 _DB_FILENAME = os.environ.get("DB_FILENAME", "acciones.db")
 
 # Base de datos SQLite (fuente de verdad); CSV solo para exportar/backup
@@ -78,9 +77,17 @@ CRYPTO_BROKER_IDS = {
     "67c8ac4deb09ee2b1a4121d3": "Tangem",
 }
 
+# Nombres legibles para criptos (normaliza cuando name == ticker_Yahoo, ej. ETH-EUR → Ethereum)
+CRYPTO_TICKER_NAMES = {
+    "BTC": "Bitcoin", "ETH": "Ethereum", "XRP": "Ripple", "SOL": "Solana",
+    "BNB": "Binance", "TRX": "Tron", "AVAX": "Avalanche", "HBAR": "Hedera",
+    "ADA": "Cardano", "DOT": "Polkadot", "LINK": "Chainlink", "MATIC": "Polygon",
+    "DOGE": "Dogecoin", "UNI": "Uniswap", "ATOM": "Cosmos", "LTC": "Litecoin",
+}
+
 
 def _get_data_mount_source() -> str | None:
-    """Intenta obtener la ruta real del host donde está montado DATA_DIR (para addons HA)."""
+    """Intenta obtener la ruta del host donde está montado DATA_DIR (add-on Home Assistant)."""
     try:
         mountinfo = Path("/proc/self/mountinfo")
         if not mountinfo.exists():
@@ -98,15 +105,6 @@ def _get_data_mount_source() -> str | None:
     except Exception:
         pass
     return None
-
-
-# Nombres legibles para criptos (normaliza cuando name == ticker_Yahoo, ej. ETH-EUR → Ethereum)
-CRYPTO_TICKER_NAMES = {
-    "BTC": "Bitcoin", "ETH": "Ethereum", "XRP": "Ripple", "SOL": "Solana",
-    "BNB": "Binance", "TRX": "Tron", "AVAX": "Avalanche", "HBAR": "Hedera",
-    "ADA": "Cardano", "DOT": "Polkadot", "LINK": "Chainlink", "MATIC": "Polygon",
-    "DOGE": "Dogecoin", "UNI": "Uniswap", "ATOM": "Cosmos", "LTC": "Litecoin",
-}
 
 
 def _get_db():
@@ -2853,19 +2851,18 @@ def main() -> None:
         label_visibility="collapsed",
     )
 
-    # Ruta de datos siempre visible (para saber dónde se guarda)
+    # Solo relevante en el add-on (Linux): en Windows /proc no existe y no se muestra ruido extra
     st.sidebar.caption("**📁 Ubicación de datos:**")
     mount_src = _get_data_mount_source()
     if mount_src:
         st.sidebar.code(f"Host: {mount_src}\nBD: {DB_PATH}\nCSV: {CSV_PATH}", language=None)
         st.sidebar.caption("Samba: share\\\\cartera_final (o addon_configs si usas /config)")
     else:
-        st.sidebar.code(f"Dentro addon: {DB_PATH}", language=None)
+        st.sidebar.code(f"{DB_PATH}", language=None)
 
-    # Configurar ruta de datos (plan B si la UI de HA no muestra data_path)
     CONFIG_PATH_FILE = Path("/data/data_path_override.txt")
     with st.sidebar.expander("⚙️ Ruta de datos (configurar)"):
-        st.caption("Por defecto: /share/cartera_final (Samba: share\\\\cartera_final). Reinicia el add-on para aplicar.")
+        st.caption("Por defecto: /share/cartera_final. Reinicia el add-on tras cambiar.")
         current_override = CONFIG_PATH_FILE.read_text().strip() if CONFIG_PATH_FILE.exists() else ""
         new_path = st.text_input("Ruta (ej. /share/cartera_final, /config)", value=current_override or str(_DATA_DIR), key="data_path_input")
         if st.button("Guardar ruta", key="save_data_path"):
@@ -2880,119 +2877,43 @@ def main() -> None:
                 else:
                     if CONFIG_PATH_FILE.exists():
                         CONFIG_PATH_FILE.unlink()
-                    st.info("Eliminado. Se usará la ruta por defecto (/share/cartera_final). Reinicia el add-on.")
+                    st.info("Eliminado. Se usará la ruta por defecto. Reinicia el add-on.")
             except Exception as e:
                 st.error(f"No se pudo guardar: {e}")
 
     with st.sidebar.expander("Mantenimiento"):
         st.caption(
-            "Los datos se guardan en la base SQLite. Exporta a CSV para respaldo; "
+            f"Los datos se guardan en la base SQLite ({Path(DB_PATH).name}). Exporta a CSV para respaldo; "
             "no abras los CSV con Excel si no quieres corromper el formato."
         )
         st.caption("**Acciones / ETFs:**")
-        if st.button("Exportar acciones a CSV (respaldo)", key="exp_acc"):
-            df_exp = load_data()
-            if df_exp.empty:
-                st.warning("No hay movimientos de acciones para exportar.")
+        if st.button("Exportar acciones a CSV (respaldo)"):
+            if export_to_csv():
+                st.success("Exportado a acciones.csv. Recargando…")
+                st.rerun()
             else:
-                cols_exp = [c for c in MOVIMIENTOS_COLUMNS if c in df_exp.columns]
-                if cols_exp:
-                    out_exp = df_exp[cols_exp].copy()
-                    for col in ("date", "time"):
-                        if col in out_exp.columns:
-                            out_exp[col] = out_exp[col].astype(str)
-                    csv_str = out_exp.to_csv(index=False, decimal=CSV_DECIMAL, sep=CSV_SEP, encoding=CSV_ENCODING)
-                    csv_bytes = csv_str.encode(CSV_ENCODING)
-                    export_dir = _DATA_DIR / "cartera_export"
-                    export_path = export_dir / "acciones.csv"
-                    try:
-                        export_dir.mkdir(parents=True, exist_ok=True)
-                        export_path.write_text(csv_str, encoding=CSV_ENCODING)
-                        st.success(f"Exportado a **{export_dir}/acciones.csv**")
-                        st.caption("Misma ubicación que la BD. Enlace alternativo si no puedes acceder:")
-                        b64 = base64.b64encode(csv_bytes).decode()
-                        st.markdown(
-                            f'<a href="data:text/csv;base64,{b64}" download="acciones.csv" '
-                            'style="display:inline-block;padding:0.5rem 1rem;background:#ff4b4b;color:white;border-radius:0.5rem;text-decoration:none;">'
-                            '⬇️ Descargar acciones.csv</a>',
-                            unsafe_allow_html=True,
-                        )
-                    except Exception as e:
-                        st.error(f"No se pudo guardar: {e}")
-                        b64 = base64.b64encode(csv_bytes).decode()
-                        st.markdown(
-                            f'<a href="data:text/csv;base64,{b64}" download="acciones.csv" '
-                            'style="display:inline-block;padding:0.5rem 1rem;background:#ff4b4b;color:white;border-radius:0.5rem;text-decoration:none;">'
-                            '⬇️ Descargar (enlace alternativo)</a>',
-                            unsafe_allow_html=True,
-                        )
-        uploaded_acc = st.file_uploader("Restaurar acciones desde CSV", type=["csv"], key="upload_acciones")
-        if uploaded_acc is not None:
-            try:
-                df_up = pd.read_csv(uploaded_acc, sep=CSV_SEP, encoding=CSV_ENCODING, dtype=str, keep_default_na=False)
-                cols_up = [c for c in MOVIMIENTOS_COLUMNS if c in df_up.columns]
-                if cols_up:
-                    for col in ["positionNumber", "price", "total", "totalBaseCurrency", "totalWithComission", "totalWithComissionBaseCurrency", "comission", "taxes", "exchangeRate"]:
-                        if col in df_up.columns:
-                            s = df_up[col].astype(str).str.strip().str.replace(",", ".", regex=False)
-                            df_up[col] = pd.to_numeric(s, errors="coerce")
-                    if "date" in df_up.columns:
-                        df_up["date"] = df_up["date"].astype(str).str.split("T").str[0].str.strip()
-                    if "time" in df_up.columns:
-                        df_up["time"] = df_up["time"].astype(str).str.strip().apply(_normalize_time_to_24h)
-                    write_full_db(df_up[[c for c in MOVIMIENTOS_COLUMNS if c in df_up.columns]])
-                    load_data.clear()
-                    st.success(f"Restaurados {len(df_up)} movimientos desde el CSV.")
-                    st.rerun()
-                else:
-                    st.error("El CSV no tiene las columnas esperadas.")
-            except Exception as e:
-                st.error(f"No se pudo leer el CSV: {e}")
+                st.error("No se pudo exportar.")
+        if st.button("Restaurar acciones desde acciones.csv"):
+            ok, msg = restore_movimientos_from_csv()
+            if ok:
+                st.success(msg)
+                st.rerun()
+            else:
+                st.error(msg)
         st.caption("**Fondos:**")
-        if st.button("Exportar fondos a CSV (respaldo)", key="exp_fondos"):
-            df_fondos_exp = load_data_fondos()
-            if df_fondos_exp is None or df_fondos_exp.empty:
-                st.warning("No hay movimientos de fondos para exportar.")
+        if st.button("Exportar fondos a CSV (respaldo)"):
+            if export_fondos_to_csv():
+                st.success("Exportado a fondos.csv. Recargando…")
+                st.rerun()
             else:
-                cols_fexp = [c for c in MOVIMIENTOS_COLUMNS if c in df_fondos_exp.columns]
-                if cols_fexp:
-                    out_fexp = df_fondos_exp[cols_fexp].copy()
-                    for col in ("date", "time"):
-                        if col in out_fexp.columns:
-                            out_fexp[col] = out_fexp[col].astype(str)
-                    csv_fondos_str = out_fexp.to_csv(index=False, decimal=CSV_DECIMAL, sep=CSV_SEP, encoding=CSV_ENCODING)
-                    export_dir = _DATA_DIR / "cartera_export"
-                    export_path_f = export_dir / "fondos.csv"
-                    try:
-                        export_dir.mkdir(parents=True, exist_ok=True)
-                        export_path_f.write_text(csv_fondos_str, encoding=CSV_ENCODING)
-                        st.success(f"Exportado a **{export_dir}/fondos.csv**")
-                    except Exception as e:
-                        st.error(f"No se pudo guardar: {e}")
-        uploaded_fondos = st.file_uploader("Restaurar fondos desde CSV", type=["csv"], key="upload_fondos")
-        if uploaded_fondos is not None:
-            try:
-                df_fup = pd.read_csv(uploaded_fondos, sep=CSV_SEP, encoding=CSV_ENCODING, dtype=str, keep_default_na=False)
-                if "nombre" in df_fup.columns and "name" not in df_fup.columns:
-                    df_fup["name"] = df_fup["nombre"].astype(str).str.strip()
-                cols_fup = [c for c in MOVIMIENTOS_COLUMNS if c in df_fup.columns]
-                if cols_fup:
-                    for col in ["positionNumber", "price", "total", "totalBaseCurrency", "totalWithComission", "totalWithComissionBaseCurrency", "comission", "taxes", "exchangeRate"]:
-                        if col in df_fup.columns:
-                            s = df_fup[col].astype(str).str.strip().str.replace(",", ".", regex=False)
-                            df_fup[col] = pd.to_numeric(s, errors="coerce")
-                    if "date" in df_fup.columns:
-                        df_fup["date"] = df_fup["date"].astype(str).str.split("T").str[0].str.strip()
-                    if "time" in df_fup.columns:
-                        df_fup["time"] = df_fup["time"].astype(str).str.strip().apply(_normalize_time_to_24h)
-                    write_full_db_fondos(df_fup[[c for c in MOVIMIENTOS_COLUMNS if c in df_fup.columns]])
-                    load_data_fondos.clear()
-                    st.success(f"Restaurados {len(df_fup)} movimientos de fondos desde el CSV.")
-                    st.rerun()
-                else:
-                    st.error("El CSV no tiene las columnas esperadas.")
-            except Exception as e:
-                st.error(f"No se pudo leer el CSV: {e}")
+                st.error("No se pudo exportar fondos.")
+        if st.button("Restaurar fondos desde fondos.csv"):
+            ok, msg = restore_fondos_from_csv()
+            if ok:
+                st.success(msg)
+                st.rerun()
+            else:
+                st.error(msg)
         st.caption("**Criptos:**")
         if st.button("Exportar criptos a movimientos_criptos.csv (respaldo)"):
             if export_criptos_to_csv():
