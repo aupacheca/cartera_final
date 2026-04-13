@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "filios-core"
+version = "0.1.0"
+requires-python = ">=3.10"
+description = "Núcleo compartido (FIFO, ISIN, BD) para Filios y Cartera FINAL"
+
+[tool.setuptools]
+packages = ["filios_core", "filios_core.fifo"]
