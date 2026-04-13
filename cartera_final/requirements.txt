@@ -1,0 +1,7 @@
+# Instalar antes el paquete local desde la raíz del monorepo:
+#   pip install -e ..
+streamlit>=1.39.0
+pandas>=2.2.0
+numpy>=1.26.0
+yfinance>=0.2.40
+plotly>=5.22.0

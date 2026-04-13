@@ -1,0 +1,28 @@
+# Contexto de build: raíz del monorepo (carpeta que contiene filios_core/, cartera_final/, pyproject.toml).
+#   docker build -f cartera_final/Dockerfile.monorepo .
+#
+ARG BUILD_FROM
+FROM ${BUILD_FROM}
+
+RUN apk add --no-cache build-base libffi-dev libstdc++
+
+WORKDIR /app
+
+COPY pyproject.toml /app/
+COPY filios_core /app/filios_core/
+RUN pip3 install --no-cache-dir /app
+
+COPY cartera_final/requirements.txt /tmp/requirements.txt
+RUN pip3 install --no-cache-dir --prefer-binary -r /tmp/requirements.txt
+
+COPY cartera_final/app.py /app/
+
+ENV DATA_DIR=/share/cartera_final
+WORKDIR /share/cartera_final
+
+EXPOSE 8503
+
+COPY cartera_final/run.sh /run.sh
+RUN sed -i 's/\r$//' /run.sh && chmod a+x /run.sh
+
+CMD ["/run.sh"]
