@@ -1,0 +1,4 @@
+# Lun–Vie, hora Europe/Madrid (TZ en Dockerfile): 9:30, 16:00, 22:00
+30	9	*	*	1-5	/app/entry_refresh.sh
+0	16	*	*	1-5	/app/entry_refresh.sh
+0	22	*	*	1-5	/app/entry_refresh.sh

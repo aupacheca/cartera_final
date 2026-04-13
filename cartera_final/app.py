@@ -1342,12 +1342,6 @@ def restore_fondos_from_csv() -> tuple[bool, str]:
     return True, f"Restaurados {len(df)} movimientos de fondos desde {FONDOS_CSV_PATH}. Las acciones no se han modificado."
 
 
-st.set_page_config(
-    page_title="Cartera de Inversión",
-    layout="wide",
-)
-
-
 @st.cache_data
 def load_data() -> pd.DataFrame:
     """
@@ -5056,7 +5050,69 @@ def fifo_tramos_ejercicio_desglose_por_fecha_venta(
     return out
 
 
+def _build_positions_base_cartera() -> pd.DataFrame:
+    """
+    Posiciones agregadas (acciones FIFO + fondos + criptos), misma lógica que la vista Cartera.
+    """
+    df = load_data()
+    positions_acc = compute_positions_fifo(df)
+    positions_acc["Origen"] = "Acciones"
+    df_fondos = load_data_fondos()
+    positions_fondos_df = positions_fondos_to_dataframe(compute_positions_fondos(df_fondos))
+    positions_fondos_df["Origen"] = "Fondos"
+    df_crip_cartera = load_data_criptos()
+    positions_crip_df = compute_positions_criptos(df_crip_cartera)
+    if not positions_crip_df.empty:
+        positions_crip_df = positions_crip_df.rename(
+            columns={
+                "Broker": "Broker",
+                "Ticker": "Ticker",
+                "Ticker_Yahoo": "Ticker_Yahoo",
+                "Nombre": "Nombre",
+                "Cantidad": "Titulos",
+                "Inversion \uFFFD": "Inversion €",
+                "Inversion ?": "Inversion €",
+            }
+        )
+        if "Inversion €" not in positions_crip_df.columns and "Inversion \uFFFD" in positions_crip_df.columns:
+            positions_crip_df["Inversion €"] = positions_crip_df["Inversion \uFFFD"]
+        positions_crip_df["Tipo activo"] = "crypto"
+        positions_crip_df["Origen"] = "Criptos"
+        positions_crip_df["Moneda Activo"] = "EUR"
+        positions_crip_df["Moneda Yahoo"] = "EUR"
+        return pd.concat([positions_acc, positions_fondos_df, positions_crip_df], ignore_index=True)
+    return pd.concat([positions_acc, positions_fondos_df], ignore_index=True)
+
+
+def refresh_cotizaciones_to_disk() -> tuple[bool, str]:
+    """Recalcula posiciones, descarga cotizaciones y guarda caché en disco (cron / CLI sin Streamlit)."""
+    load_data.clear()
+    load_data_fondos.clear()
+    if hasattr(load_data_criptos, "clear"):
+        load_data_criptos.clear()
+    try:
+        positions_base = _build_positions_base_cartera()
+    except Exception as e:
+        return False, f"Cartera: error al calcular posiciones: {e}"
+    if positions_base.empty:
+        return False, "Sin posiciones abiertas; no hay cotizaciones que guardar."
+    cotiz_signature = _cotizaciones_signature(positions_base)
+    if not cotiz_signature:
+        return False, "Firma de cartera vacía."
+    precios_manuales = load_precios_manuales()
+    try:
+        enriched = enrich_with_market_data(positions_base.copy(), manual_prices=precios_manuales)
+        save_cotizaciones_cache(enriched, cotiz_signature)
+    except Exception as e:
+        return False, f"Error al obtener/guardar cotizaciones: {e}"
+    return True, f"OK: {len(enriched)} posiciones; caché en {COTIZACIONES_CACHE_PATH}."
+
+
 def main() -> None:
+    st.set_page_config(
+        page_title="Cartera de Inversión",
+        layout="wide",
+    )
     st.title("Cartera de Inversión")
 
     df = load_data()
@@ -8505,37 +8561,7 @@ Los **coeficientes de actualización** y el cuadre final los calcula el **softwa
 
     # Vista normal de cartera agregada (acciones + fondos; filtro por tipo abajo)
     # FIFO en ventas y traspasos para coincidir con Filios
-    positions_acc = compute_positions_fifo(df)
-    positions_acc["Origen"] = "Acciones"
-    df_fondos = load_data_fondos()
-    positions_fondos_df = positions_fondos_to_dataframe(compute_positions_fondos(df_fondos))
-    positions_fondos_df["Origen"] = "Fondos"
-    # Criptos: posiciones desde movimientos_criptos
-    df_crip_cartera = load_data_criptos()
-    positions_crip_df = compute_positions_criptos(df_crip_cartera)
-    if not positions_crip_df.empty:
-        # Normalizar nombres de columnas (problemas de encoding del símbolo € en consola)
-        positions_crip_df = positions_crip_df.rename(
-            columns={
-                "Broker": "Broker",
-                "Ticker": "Ticker",
-                "Ticker_Yahoo": "Ticker_Yahoo",
-                "Nombre": "Nombre",
-                "Cantidad": "Titulos",
-                "Inversion \uFFFD": "Inversion €",
-                "Inversion ?": "Inversion €",
-            }
-        )
-        if "Inversion €" not in positions_crip_df.columns and "Inversion \uFFFD" in positions_crip_df.columns:
-            positions_crip_df["Inversion €"] = positions_crip_df["Inversion \uFFFD"]
-        positions_crip_df["Tipo activo"] = "crypto"
-        positions_crip_df["Origen"] = "Criptos"
-        # Rellenar campos mínimos para compatibilidad con enrich_with_market_data
-        positions_crip_df["Moneda Activo"] = "EUR"
-        positions_crip_df["Moneda Yahoo"] = "EUR"
-        positions_base = pd.concat([positions_acc, positions_fondos_df, positions_crip_df], ignore_index=True)
-    else:
-        positions_base = pd.concat([positions_acc, positions_fondos_df], ignore_index=True)
+    positions_base = _build_positions_base_cartera()
 
     if positions_base.empty:
         st.info("No hay posiciones abiertas en la cartera.")
