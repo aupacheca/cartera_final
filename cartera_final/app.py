@@ -66,6 +66,14 @@ from filios_core.isin import (
 )
 
 
+def _style_map(styler, func, **kwargs):
+    """pandas ≥2.1: Styler.map; versiones anteriores: Styler.applymap."""
+    mapper = getattr(styler, "map", None)
+    if mapper is not None:
+        return mapper(func, **kwargs)
+    return styler.applymap(func, **kwargs)
+
+
 def _get_data_mount_source() -> str | None:
     """Intenta obtener la ruta del host donde está montado DATA_DIR (add-on Home Assistant)."""
     try:
@@ -3466,7 +3474,7 @@ def render_analisis_gp_ventas() -> None:
     fmt_m = {c: fmt_eur for c in disp_show.columns if "€" in str(c)}
     sty = disp_show.style.format(fmt_m, na_rep="–")
     if pnl_col in disp_show.columns:
-        sty = sty.applymap(color_pnl, subset=[pnl_col])
+        sty = _style_map(sty, color_pnl, subset=[pnl_col])
     st.dataframe(sty, use_container_width=True, hide_index=True)
 
     d["_ym"] = d["_dt"].dt.to_period("M")
@@ -3530,7 +3538,7 @@ def render_analisis_gp_ventas() -> None:
         .style.format({c: fmt_eur for c in col_order if "€" in str(c)}, na_rep="–")
     )
     if pnl_col in col_order:
-        sty_m = sty_m.applymap(color_pnl, subset=[pnl_col])
+        sty_m = _style_map(sty_m, color_pnl, subset=[pnl_col])
     st.dataframe(sty_m, use_container_width=True, hide_index=True)
 
 
@@ -6739,9 +6747,7 @@ def main() -> None:
                             st.error(f"Error al guardar: {e}")
             else:
                 st.dataframe(
-                    display_mov[cols_presentes].style.applymap(
-                        color_tipo, subset=["Tipo"]
-                    ),
+                    _style_map(display_mov[cols_presentes].style, color_tipo, subset=["Tipo"]),
                     use_container_width=True,
                 )
 
@@ -8354,7 +8360,7 @@ def main() -> None:
                 )
                 pnl_cols = [c for c in col_det if "Plusvalía" in str(c)]
                 if pnl_cols:
-                    sty = sty.applymap(color_pnl, subset=pnl_cols)
+                    sty = _style_map(sty, color_pnl, subset=pnl_cols)
                 st.dataframe(sty, use_container_width=True)
                 with st.expander(
                     "Cómo usar este CSV en el programa de Renta (p. ej. Zergabidea)",
@@ -8425,7 +8431,7 @@ Los **coeficientes de actualización** y el cuadre final los calcula el **softwa
                 sty_r = disp.style.format({"Pérdida (€)": lambda x: fmt_eur(x)}, na_rep="–")
                 pnl_col = [c for c in disp.columns if "Pérdida" in str(c)]
                 if pnl_col:
-                    sty_r = sty_r.applymap(color_pnl, subset=pnl_col)
+                    sty_r = _style_map(sty_r, color_pnl, subset=pnl_col)
                 st.dataframe(sty_r, use_container_width=True)
                 csv_r = disp.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig")
                 st.download_button(
@@ -8942,21 +8948,22 @@ Los **coeficientes de actualización** y el cuadre final los calcula el **softwa
     ]
 
     # Formateo numérico para la visualización
-    styler = (
-        table[display_cols]
-        .style.format(
-            {
-                "Titulos": fmt_qty,
-                "Precio md + com/imp (€)": fmt_eur,
-                "Total inv + com/imp (€)": fmt_eur,
-                "Valor mercado (€)": fmt_eur,
-                "GyP no realizadas (€)": fmt_eur,
-                "GyP no realizadas %": lambda v: "-" if pd.isna(v) else f"{v:.2f} %",
-                "GyP hoy (€)": fmt_eur,
-                "GyP hoy %": lambda v: "-" if pd.isna(v) else f"{v:.2f} %",
-            }
-        )
-        .applymap(color_pnl, subset=["GyP no realizadas (€)", "GyP no realizadas %", "GyP hoy (€)", "GyP hoy %"])
+    styler = table[display_cols].style.format(
+        {
+            "Titulos": fmt_qty,
+            "Precio md + com/imp (€)": fmt_eur,
+            "Total inv + com/imp (€)": fmt_eur,
+            "Valor mercado (€)": fmt_eur,
+            "GyP no realizadas (€)": fmt_eur,
+            "GyP no realizadas %": lambda v: "-" if pd.isna(v) else f"{v:.2f} %",
+            "GyP hoy (€)": fmt_eur,
+            "GyP hoy %": lambda v: "-" if pd.isna(v) else f"{v:.2f} %",
+        }
+    )
+    styler = _style_map(
+        styler,
+        color_pnl,
+        subset=["GyP no realizadas (€)", "GyP no realizadas %", "GyP hoy (€)", "GyP hoy %"],
     )
 
     _disp_tbl = table[display_cols]
