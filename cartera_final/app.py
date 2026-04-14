@@ -5,7 +5,8 @@ import re
 import sqlite3
 import urllib.error
 import urllib.request
-from datetime import datetime, time as dt_time
+from datetime import datetime, time as dt_time, timezone
+from zoneinfo import ZoneInfo
 from collections import OrderedDict
 from pathlib import Path
 from functools import lru_cache
@@ -64,6 +65,32 @@ from filios_core.isin import (
     _resolve_movimiento_isin,
     lookup_ticker_yahoo_by_isin,
 )
+
+
+_MADRID_TZ = ZoneInfo("Europe/Madrid")
+
+
+def _now_madrid_iso() -> str:
+    """Marca de tiempo para caché de cotizaciones (hora local España, con offset en ISO)."""
+    return datetime.now(_MADRID_TZ).isoformat(timespec="seconds")
+
+
+def _parse_cotiz_updated_at(s: str) -> datetime:
+    """
+    Convierte updated_at a aware Europe/Madrid para mostrar.
+    Valores antiguos sin zona venían en UTC (reloj del contenedor); se interpretan como UTC.
+    """
+    raw = (s or "").strip()
+    if not raw:
+        raise ValueError("empty")
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    dt = datetime.fromisoformat(raw)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc).astimezone(_MADRID_TZ)
+    else:
+        dt = dt.astimezone(_MADRID_TZ)
+    return dt
 
 
 def _style_map(styler, func, **kwargs):
@@ -2603,7 +2630,7 @@ def save_cotizaciones_cache(df: pd.DataFrame, signature: str) -> None:
     """Guarda cotizaciones y metadatos en disco."""
     try:
         df.to_pickle(COTIZACIONES_CACHE_PATH)
-        meta = {"signature": signature, "updated_at": datetime.now().isoformat()}
+        meta = {"signature": signature, "updated_at": _now_madrid_iso()}
         with open(COTIZACIONES_META_PATH, "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=0)
     except Exception:
@@ -3863,7 +3890,7 @@ def render_analisis_distribucion(df_acciones: pd.DataFrame) -> None:
                 st.session_state["cartera_enriched"] = enrich_with_market_data(
                     positions_full.copy(), manual_prices=precios_m
                 )
-                st.session_state["cartera_enriched_updated_at"] = datetime.now().isoformat()
+                st.session_state["cartera_enriched_updated_at"] = _now_madrid_iso()
                 if sig_full:
                     save_cotizaciones_cache(st.session_state["cartera_enriched"], sig_full)
             st.rerun()
@@ -3874,7 +3901,7 @@ def render_analisis_distribucion(df_acciones: pd.DataFrame) -> None:
         upd = st.session_state.get("cartera_enriched_updated_at")
         if upd:
             try:
-                dtu = datetime.fromisoformat(upd.replace("Z", "+00:00"))
+                dtu = _parse_cotiz_updated_at(upd)
                 st.caption(
                     f"Cotizaciones del {dtu.strftime('%d/%m/%Y %H:%M')} (mismas que en Cartera). "
                     "Pulsa **Actualizar cotizaciones** aquí o en Cartera para refrescar."
@@ -8596,7 +8623,7 @@ Los **coeficientes de actualización** y el cuadre final los calcula el **softwa
                 st.session_state["cartera_enriched"] = enrich_with_market_data(
                     positions_base.copy(), manual_prices=precios_manuales
                 )
-                st.session_state["cartera_enriched_updated_at"] = datetime.now().isoformat()
+                st.session_state["cartera_enriched_updated_at"] = _now_madrid_iso()
                 if cotiz_signature:
                     save_cotizaciones_cache(st.session_state["cartera_enriched"], cotiz_signature)
             st.rerun()
@@ -8675,7 +8702,7 @@ Los **coeficientes de actualización** y el cuadre final los calcula el **softwa
         updated_at = st.session_state.get("cartera_enriched_updated_at")
         if updated_at:
             try:
-                dt = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+                dt = _parse_cotiz_updated_at(updated_at)
                 st.caption(f"Cotizaciones del {dt.strftime('%d/%m/%Y %H:%M')}. Pulsa **Actualizar cotizaciones** para refrescar.")
             except Exception:
                 st.caption("Pulsa **Actualizar cotizaciones** para refrescar los precios.")

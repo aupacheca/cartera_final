@@ -33,8 +33,8 @@ fi
 
 echo "Cartera FINAL - Datos en: $DATA_DIR (Samba: share/cartera_final)"
 
-# Cotizaciones automáticas (lun–vie 9:30, 16:00, 22:00 hora $TZ → crontabs_root)
-crond
+# Cotizaciones automáticas lun–vie 9:30, 16:00, 22:00 (Europe/Madrid, ver cotizaciones_scheduler.py)
+python3 /app/cotizaciones_scheduler.py &
 
 exec python3 -m streamlit run /app/app.py \
     --server.port=8503 \
