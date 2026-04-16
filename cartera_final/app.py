@@ -7897,7 +7897,7 @@ def main() -> None:
             _filios_col, _p2p_col = st.columns([1.15, 1])
             with _filios_col:
                 with st.container(border=True):
-                    st.markdown("###### Renta variable — dividendos (Filios)")
+                    st.markdown("###### Dividendos")
                     _dv1, _dv2 = st.columns(2)
                     with _dv1:
                         st.markdown(
