@@ -26,7 +26,6 @@ from filios_core.config import (
     FONDOS_CSV_PATH,
     MOVIMIENTOS_CRIPTOS_CSV_PATH,
     PRECIOS_MANUALES_PATH,
-    data_path_override_file,
 )
 from filios_core.constants import (
     CRYPTO_BROKER_IDS,
@@ -5162,15 +5161,12 @@ def main() -> None:
     else:
         st.sidebar.code(f"{DB_PATH}", language=None)
 
-    CONFIG_PATH_FILE = data_path_override_file()
+    CONFIG_PATH_FILE = Path("/data/data_path_override.txt")
     with st.sidebar.expander("⚙️ Ruta de datos (configurar)"):
-        st.caption(
-            "Add-on: /share/cartera_final. PC: carpeta de red (ej. Z:\\cartera_final). "
-            "Tras guardar, **reinicia Streamlit** (PC) o el add-on (HA)."
-        )
+        st.caption("Por defecto: /share/cartera_final. Reinicia el add-on tras cambiar.")
         current_override = CONFIG_PATH_FILE.read_text().strip() if CONFIG_PATH_FILE.exists() else ""
         new_path = st.text_input(
-            "Ruta de la carpeta de datos",
+            "Ruta (ej. /share/cartera_final, /config)",
             value=current_override or str(_DATA_DIR),
             key="data_path_input",
         )
@@ -5178,20 +5174,15 @@ def main() -> None:
             try:
                 if new_path and new_path.strip():
                     p = new_path.strip()
-                    is_win_drive = len(p) >= 2 and p[1] == ":"
-                    is_unc = p.startswith("\\\\")
-                    if not is_win_drive and not is_unc and not p.startswith("/"):
+                    if not p.startswith("/"):
                         p = "/" + p
                     CONFIG_PATH_FILE.parent.mkdir(parents=True, exist_ok=True)
                     CONFIG_PATH_FILE.write_text(p, encoding="utf-8")
-                    st.success(
-                        f"Guardado en {CONFIG_PATH_FILE}. **Cierra y vuelve a arrancar Streamlit** "
-                        f"(o reinicia el add-on) para cargar: {p}"
-                    )
+                    st.success(f"Guardado. Reinicia el add-on para usar: {p}")
                 else:
                     if CONFIG_PATH_FILE.exists():
                         CONFIG_PATH_FILE.unlink()
-                    st.info("Eliminado. Se usará DATA_DIR por entorno o carpeta actual. Reinicia la app.")
+                    st.info("Eliminado. Se usará la ruta por defecto. Reinicia el add-on.")
             except Exception as e:
                 st.error(f"No se pudo guardar: {e}")
 
