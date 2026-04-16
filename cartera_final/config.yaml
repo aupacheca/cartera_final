@@ -3,7 +3,7 @@
 
 name: Cartera FINAL
 description: Cartera de inversiones (acciones, ETFs, fondos, criptos) con Streamlit. Datos en share/cartera_final (Samba). Puerto 8503.
-version: "1.0.4"
+version: "1.0.5"
 slug: cartera_final
 url: "https://github.com/aupacheca/cartera_final"
 arch:
