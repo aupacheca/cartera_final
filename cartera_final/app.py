@@ -8715,7 +8715,11 @@ Los **coeficientes de actualización** y el cuadre final los calcula el **softwa
     sin_cotiz = []
     for idx, row in positions.iterrows():
         t = str(row.get(ticker_col_pm) or "").strip()
-        if t and (pd.isna(row.get(precio_col)) or row.get(precio_col) is None):
+        if not t:
+            continue
+        pv = row.get(precio_col)
+        sin_precio_yahoo = pd.isna(pv) or pv is None
+        if sin_precio_yahoo or t in precios_manuales:
             tipo = str(row.get("Tipo activo", "") or "").strip().lower()
             sin_cotiz.append((row.get("Broker"), t, row.get("Nombre", t), tipo))
     if sin_cotiz:
@@ -8761,10 +8765,11 @@ Los **coeficientes de actualización** y el cuadre final los calcula el **softwa
             pm_updated = dict(precios_manuales)
             for broker, ticker, nombre in sin_cotiz_filtrado:
                 key_pm = f"pm_{broker}_{ticker}".replace(" ", "_")
-                val_actual = precios_manuales.get(ticker, "")
+                val_actual = precios_manuales.get(ticker)
+                val_in = float(val_actual) if val_actual is not None else 0.0
                 nuevo = st.number_input(
                     f"{ticker} ({nombre})",
-                    value=float(val_actual) if val_actual else 0.0,
+                    value=val_in,
                     min_value=0.0,
                     step=0.01,
                     format="%.4f",
@@ -8772,6 +8777,8 @@ Los **coeficientes de actualización** y el cuadre final los calcula el **softwa
                 )
                 if nuevo and nuevo > 0:
                     pm_updated[ticker] = nuevo
+                elif ticker in pm_updated:
+                    pm_updated.pop(ticker, None)
             if st.button("Guardar precios manuales", key="btn_guardar_pm"):
                 save_precios_manuales(pm_updated)
                 st.success("Precios guardados. Recargando…")
