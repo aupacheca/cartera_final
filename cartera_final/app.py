@@ -8192,40 +8192,45 @@ def main() -> None:
                 ).rename(columns={
                     "ticker": "Posición",
                     "isin": "ISIN",
-                    "total_bruto": "Total bruto (€)",
+                    "total_bruto": "Bruto (€)",
                     "ret_origen_real": "Retención origen real (€)",
                     "ret_origen_imputable": "Retención origen imputable (€)",
                     "ret_origen_no_recup": "Retención origen no recuperable (€)",
-                    "total_despues_origen": "Total bruto después de origen (€)",
+                    "total_despues_origen": "Neto tras retención en origen (€)",
                     "ret_dest": "Retención en dest. realizada (€)",
-                    "total_neto": "Total neto cobrado (€)",
-                    "total_neto_devol": "Total neto con devolución (€)",
+                    "total_neto": "Neto cobrado real (€)",
+                    "total_neto_devol": "Neto final estimado tras IRPF (€)",
                 })
+                agg_div["Ajuste fiscal España estimado (€)"] = (
+                    agg_div["Neto final estimado tras IRPF (€)"] - agg_div["Neto cobrado real (€)"]
+                )
                 _cols_div_orden = [
                     "Posición",
                     "ISIN",
-                    "Total bruto (€)",
+                    "Bruto (€)",
                     "Retención origen real (€)",
-                    "Total bruto después de origen (€)",
+                    "Retención en dest. realizada (€)",
+                    "Neto cobrado real (€)",
+                    "Neto tras retención en origen (€)",
                     "Retención origen imputable (€)",
                     "Retención origen no recuperable (€)",
-                    "Retención en dest. realizada (€)",
-                    "Total neto cobrado (€)",
-                    "Total neto con devolución (€)",
+                    "Ajuste fiscal España estimado (€)",
+                    "Neto final estimado tras IRPF (€)",
                 ]
                 agg_div = agg_div[[c for c in _cols_div_orden if c in agg_div.columns]]
                 # Fila TOTAL
                 fila_total = pd.DataFrame([{
                     "Posición": "TOTAL",
                     "ISIN": "",
-                    "Total bruto (€)": agg_div["Total bruto (€)"].sum(),
+                    "Bruto (€)": agg_div["Bruto (€)"].sum(),
                     "Retención origen real (€)": agg_div["Retención origen real (€)"].sum(),
-                    "Total bruto después de origen (€)": agg_div["Total bruto después de origen (€)"].sum(),
+                    "Retención en dest. realizada (€)": agg_div["Retención en dest. realizada (€)"].sum(),
+                    "Neto cobrado real (€)": agg_div["Neto cobrado real (€)"].sum(),
+                    "Neto tras retención en origen (€)": agg_div["Neto tras retención en origen (€)"].sum(),
                     "Retención origen imputable (€)": agg_div["Retención origen imputable (€)"].sum(),
                     "Retención origen no recuperable (€)": agg_div["Retención origen no recuperable (€)"].sum(),
-                    "Retención en dest. realizada (€)": agg_div["Retención en dest. realizada (€)"].sum(),
-                    "Total neto cobrado (€)": agg_div["Total neto cobrado (€)"].sum(),
-                    "Total neto con devolución (€)": agg_div["Total neto con devolución (€)"].sum(),
+                    "Ajuste fiscal España estimado (€)": agg_div["Ajuste fiscal España estimado (€)"].sum(),
+                    "Neto final estimado tras IRPF (€)": agg_div["Neto final estimado tras IRPF (€)"].sum(),
                 }])
                 agg_div = pd.concat([fila_total, agg_div], ignore_index=True)
                 agg_div = agg_div[[c for c in _cols_div_orden if c in agg_div.columns]]
