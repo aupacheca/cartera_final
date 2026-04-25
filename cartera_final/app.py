@@ -8132,19 +8132,27 @@ def main() -> None:
 
         with tab_gp_activo:
             st.subheader("Dividendos y cupones por posición")
+            st.caption(
+                "Retención origen **real** = bruto − neto tras origen; "
+                "retención origen **imputable** = crédito fiscal (Filios: retentionReturned); "
+                "retención origen **no recuperable** = real − imputable."
+            )
             if div_ejercicio.empty:
                 st.info("No hay dividendos en este ejercicio.")
             else:
                 div_pos = div_ejercicio.copy()
                 div_pos["ticker"] = div_pos["ticker"] if "ticker" in div_pos.columns else div_pos["ticker_Yahoo"]
                 div_pos["total_bruto"] = div_pos["totalBaseCurrency"].apply(lambda x: _to_float_div(x, 0.0))
-                if "retentionReturnedBaseCurrency" in div_pos.columns:
-                    div_pos["impuesto_ext"] = div_pos["retentionReturnedBaseCurrency"].apply(lambda x: _to_float_div(x, 0.0))
-                else:
-                    div_pos["impuesto_ext"] = div_pos["totalBaseCurrency"].apply(lambda x: _to_float_div(x, 0.0)) - div_pos["netoBaseCurrency"].apply(
-                        lambda x: _to_float_div(x, 0.0)
-                    )
                 div_pos["total_despues_origen"] = div_pos["netoBaseCurrency"].apply(lambda x: _to_float_div(x, 0.0))
+                div_pos["ret_origen_real"] = (div_pos["total_bruto"] - div_pos["total_despues_origen"]).clip(lower=0.0)
+                if "retentionReturnedBaseCurrency" in div_pos.columns:
+                    div_pos["ret_origen_imputable"] = div_pos["retentionReturnedBaseCurrency"].apply(lambda x: _to_float_div(x, 0.0))
+                else:
+                    div_pos["ret_origen_imputable"] = div_pos["ret_origen_real"]
+                if "originRetentionLossBaseCurrency" in div_pos.columns:
+                    div_pos["ret_origen_no_recup"] = div_pos["originRetentionLossBaseCurrency"].apply(lambda x: _to_float_div(x, 0.0))
+                else:
+                    div_pos["ret_origen_no_recup"] = (div_pos["ret_origen_real"] - div_pos["ret_origen_imputable"]).clip(lower=0.0)
                 div_pos["ret_dest"] = div_pos["destinationRetentionBaseCurrency"].apply(lambda x: _to_float_div(x, 0.0))
                 div_pos["total_neto"] = div_pos["totalNetoBaseCurrency"].apply(lambda x: _to_float_div(x, 0.0)) if "totalNetoBaseCurrency" in div_pos.columns else (div_pos["total_despues_origen"] - div_pos["ret_dest"])
                 if "netoWithReturnBaseCurrency" in div_pos.columns:
@@ -8174,7 +8182,9 @@ def main() -> None:
                 agg_div = div_pos.groupby("ticker", as_index=False).agg(
                     isin=("isin", _isin_agrupado),
                     total_bruto=("total_bruto", "sum"),
-                    impuesto_ext=("impuesto_ext", "sum"),
+                    ret_origen_real=("ret_origen_real", "sum"),
+                    ret_origen_imputable=("ret_origen_imputable", "sum"),
+                    ret_origen_no_recup=("ret_origen_no_recup", "sum"),
                     total_despues_origen=("total_despues_origen", "sum"),
                     ret_dest=("ret_dest", "sum"),
                     total_neto=("total_neto", "sum"),
@@ -8183,26 +8193,42 @@ def main() -> None:
                     "ticker": "Posición",
                     "isin": "ISIN",
                     "total_bruto": "Total bruto (€)",
-                    "impuesto_ext": "Impuesto satisf. en el extranjero (€)",
+                    "ret_origen_real": "Retención origen real (€)",
+                    "ret_origen_imputable": "Retención origen imputable (€)",
+                    "ret_origen_no_recup": "Retención origen no recuperable (€)",
                     "total_despues_origen": "Total bruto después de origen (€)",
                     "ret_dest": "Retención en dest. realizada (€)",
                     "total_neto": "Total neto cobrado (€)",
                     "total_neto_devol": "Total neto con devolución (€)",
                 })
-                _cols_div = ["Posición", "ISIN"] + [c for c in agg_div.columns if c not in ("Posición", "ISIN")]
-                agg_div = agg_div[_cols_div]
+                _cols_div_orden = [
+                    "Posición",
+                    "ISIN",
+                    "Total bruto (€)",
+                    "Retención origen real (€)",
+                    "Total bruto después de origen (€)",
+                    "Retención origen imputable (€)",
+                    "Retención origen no recuperable (€)",
+                    "Retención en dest. realizada (€)",
+                    "Total neto cobrado (€)",
+                    "Total neto con devolución (€)",
+                ]
+                agg_div = agg_div[[c for c in _cols_div_orden if c in agg_div.columns]]
                 # Fila TOTAL
                 fila_total = pd.DataFrame([{
                     "Posición": "TOTAL",
                     "ISIN": "",
                     "Total bruto (€)": agg_div["Total bruto (€)"].sum(),
-                    "Impuesto satisf. en el extranjero (€)": agg_div["Impuesto satisf. en el extranjero (€)"].sum(),
+                    "Retención origen real (€)": agg_div["Retención origen real (€)"].sum(),
                     "Total bruto después de origen (€)": agg_div["Total bruto después de origen (€)"].sum(),
+                    "Retención origen imputable (€)": agg_div["Retención origen imputable (€)"].sum(),
+                    "Retención origen no recuperable (€)": agg_div["Retención origen no recuperable (€)"].sum(),
                     "Retención en dest. realizada (€)": agg_div["Retención en dest. realizada (€)"].sum(),
                     "Total neto cobrado (€)": agg_div["Total neto cobrado (€)"].sum(),
                     "Total neto con devolución (€)": agg_div["Total neto con devolución (€)"].sum(),
                 }])
                 agg_div = pd.concat([fila_total, agg_div], ignore_index=True)
+                agg_div = agg_div[[c for c in _cols_div_orden if c in agg_div.columns]]
                 st.dataframe(
                     agg_div.style.format({c: lambda x: fmt_eur(x) if isinstance(x, (int, float)) else x for c in agg_div.columns if "€" in str(c)}, na_rep="–"),
                     use_container_width=True,
