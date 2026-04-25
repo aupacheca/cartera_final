@@ -7752,6 +7752,13 @@ def main() -> None:
         total_neto_dividendos = div_ejercicio["totalNetoBaseCurrency"].apply(lambda x: _to_float_div(x, 0.0)).sum() if not div_ejercicio.empty and "totalNetoBaseCurrency" in div_ejercicio.columns else (
             total_dividendos_bruto - retencion_origen_efectiva_div - retencion_destino_div
         )
+        if not div_ejercicio.empty and "netoWithReturnBaseCurrency" in div_ejercicio.columns:
+            total_neto_final_irpf_div = div_ejercicio["netoWithReturnBaseCurrency"].apply(lambda x: _to_float_div(x, 0.0)).sum()
+        elif not div_ejercicio.empty and "unrealizedDestinationRetentionBaseCurrency" in div_ejercicio.columns:
+            ajuste_es = div_ejercicio["unrealizedDestinationRetentionBaseCurrency"].apply(lambda x: _to_float_div(x, 0.0)).sum()
+            total_neto_final_irpf_div = total_neto_dividendos - ajuste_es
+        else:
+            total_neto_final_irpf_div = total_neto_dividendos
 
         bruto_div_extranjero_con_ret_origen = 0.0
         _has_rr_div = not div_ejercicio.empty and "retentionReturnedBaseCurrency" in div_ejercicio.columns
@@ -7833,9 +7840,14 @@ def main() -> None:
                 help="Suma del bruto en EUR de todos los dividendos del ejercicio (campo totalBaseCurrency u homólogo).",
             )
             st.metric(
-                "Total neto dividendos (€)",
+                "Neto final estimado tras IRPF (€)",
+                fmt_eur(total_neto_final_irpf_div),
+                help="Estimación del neto final de dividendos tras ajuste fiscal español (netoWithReturnBaseCurrency u homólogo).",
+            )
+            st.metric(
+                "Neto cobrado real dividendos (€)",
                 fmt_eur(total_neto_dividendos),
-                help="Suma del neto cobrado de dividendos del ejercicio (totalNetoBaseCurrency u homólogo).",
+                help="Suma del neto realmente cobrado al abono de dividendos del ejercicio (totalNetoBaseCurrency u homólogo).",
             )
             st.metric(
                 "Comisiones (€)",
