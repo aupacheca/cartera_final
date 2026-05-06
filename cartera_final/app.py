@@ -862,11 +862,35 @@ def get_ticker_catalog(df: pd.DataFrame) -> pd.DataFrame:
     req = ["ticker_Yahoo", "ticker", "name", "positionCurrency", "positionExchange", "positionCountry", "positionType"]
     if not all(c in df.columns for c in req):
         return pd.DataFrame(columns=req)
-    return (
-        df.drop_duplicates(subset=["ticker_Yahoo"], keep="first")[req]
-        .sort_values("ticker_Yahoo")
-        .reset_index(drop=True)
-    )
+    base = df.drop_duplicates(subset=["ticker_Yahoo"], keep="first")[req].copy()
+
+    # Los spin-off crean la posición hija por redistribución de coste; añadimos esa hija al catálogo
+    # para que aparezca luego como posición seleccionable, aunque no exista una fila buy/switchbuy separada.
+    extra_rows = []
+    if "type" in df.columns:
+        sp = df[df["type"].astype(str).str.strip().str.lower() == "spinoff"].copy()
+        if not sp.empty:
+            for _, r in sp.iterrows():
+                ty = str(r.get("switchBuyPosition") or "").strip()
+                if not ty:
+                    continue
+                nm = str(r.get("switchBuyPositionType") or "").strip() or ty
+                ccy = str(r.get("positionCurrency") or "EUR").strip() or "EUR"
+                extra_rows.append(
+                    {
+                        "ticker_Yahoo": ty,
+                        "ticker": ty,
+                        "name": nm,
+                        "positionCurrency": ccy,
+                        "positionExchange": str(r.get("positionExchange") or "").strip(),
+                        "positionCountry": str(r.get("positionCountry") or "").strip(),
+                        "positionType": str(r.get("positionType") or "stock").strip().lower() or "stock",
+                    }
+                )
+    if extra_rows:
+        base = pd.concat([base, pd.DataFrame(extra_rows)], ignore_index=True)
+
+    return base.drop_duplicates(subset=["ticker_Yahoo"], keep="first").sort_values("ticker_Yahoo").reset_index(drop=True)
 
 
 def get_ticker_catalog_criptos(df: pd.DataFrame) -> pd.DataFrame:
@@ -1623,6 +1647,61 @@ def compute_positions(df: pd.DataFrame) -> pd.DataFrame:
 
             continue
 
+        # Spin-off: redistribuye coste del padre y crea/ajusta posición hija
+        if movement_type and str(movement_type).strip().lower() == "spinoff":
+            source_key = (broker, key_ticker)
+            ensure_position(source_key)
+            src = positions[source_key]
+            src_qty = float(src["quantity"])
+            if src_qty <= MIN_POSITION:
+                continue
+
+            parent_aff_qty = abs(_to_float(_safe_get(row, "positionNumber"), 0.0))
+            child_qty_total = _to_float(_safe_get(row, "spinOffBuyPositionNumber"), 0.0)
+            alloc_pct = _to_float(_safe_get(row, "spinOffBuyPositionAllocation"), 0.0)
+            alloc = max(0.0, min(1.0, alloc_pct / 100.0))
+            if parent_aff_qty <= MIN_POSITION or child_qty_total <= MIN_POSITION:
+                continue
+
+            apply_qty = min(parent_aff_qty, src_qty)
+            if apply_qty <= MIN_POSITION:
+                continue
+            ratio = child_qty_total / parent_aff_qty if parent_aff_qty > MIN_POSITION else 0.0
+            child_qty = apply_qty * ratio
+            if child_qty <= MIN_POSITION:
+                continue
+
+            child_ref = str(_safe_get(row, "spinOffBuyPosition") or "").strip()
+            child_ticker_hint = str(_safe_get(row, "switchBuyPosition") or "").strip()
+            child_name_hint = str(_safe_get(row, "switchBuyPositionType") or "").strip()
+            child_isin = _norm_isin_field(child_ref)
+            if child_isin:
+                child_ticker_y = lookup_ticker_yahoo_by_isin(child_isin) or child_ticker_hint or child_ref
+            else:
+                child_ticker_y = child_ref or child_ticker_hint
+            if not child_ticker_y:
+                continue
+            child_key = (broker, child_ticker_y)
+            ensure_position(child_key)
+            child = positions[child_key]
+            if child_name_hint:
+                child["name"] = child_name_hint
+            elif child_isin and not child.get("name"):
+                child["name"] = child_ticker_y
+
+            src_cost_eur_aff = src["cost_eur"] * (apply_qty / src_qty)
+            src_cost_local_aff = src["cost_local"] * (apply_qty / src_qty)
+            child_cost_eur = src_cost_eur_aff * alloc
+            child_cost_local = src_cost_local_aff * alloc
+
+            src["cost_eur"] -= child_cost_eur
+            src["cost_local"] -= child_cost_local
+
+            child["quantity"] += child_qty
+            child["cost_eur"] += child_cost_eur
+            child["cost_local"] += child_cost_local
+            continue
+
         # Traspaso entre brokers: movemos cantidad y coste proporcional
         if movement_type and str(movement_type).strip().lower() == "brokertransfer":
             new_broker_raw = _safe_get(row, "brokerTransferNewBroker")
@@ -1835,6 +1914,59 @@ def compute_positions_fifo(df: pd.DataFrame) -> pd.DataFrame:
                 if k in positions:
                     for lot in positions[k]["lots"]:
                         lot["qty"] *= factor
+            continue
+
+        if t == "spinoff":
+            key_src = _fifo_queue_key_stocks_cartera(row, broker, key_ticker, cat_cache)
+            ensure(key_src, row)
+            lots_src = positions[key_src]["lots"]
+            if not lots_src:
+                continue
+            parent_aff_qty = abs(_to_float(_safe_get(row, "positionNumber"), 0.0))
+            child_qty_total = _to_float(_safe_get(row, "spinOffBuyPositionNumber"), 0.0)
+            alloc_pct = _to_float(_safe_get(row, "spinOffBuyPositionAllocation"), 0.0)
+            alloc = max(0.0, min(1.0, alloc_pct / 100.0))
+            if parent_aff_qty <= MIN_POSITION or child_qty_total <= MIN_POSITION:
+                continue
+            ratio = child_qty_total / parent_aff_qty
+
+            child_ref = str(_safe_get(row, "spinOffBuyPosition") or "").strip()
+            child_ticker_hint = str(_safe_get(row, "switchBuyPosition") or "").strip()
+            child_name_hint = str(_safe_get(row, "switchBuyPositionType") or "").strip()
+            child_isin = _norm_isin_field(child_ref)
+            child_ty = lookup_ticker_yahoo_by_isin(child_isin) if child_isin else child_ref
+            child_ty = str(child_ty or child_ticker_hint or child_ref or "").strip()
+            if not child_ty:
+                continue
+            child_row = row.copy()
+            child_row["ticker_Yahoo"] = child_ty
+            child_row["ticker"] = child_ty
+            child_row["isin"] = child_isin
+            key_dst = _fifo_queue_key_stocks_cartera(child_row, broker, child_ty, cat_cache)
+            ensure(key_dst, child_row)
+            positions[key_dst]["Ticker_Yahoo"] = child_ty
+            positions[key_dst]["ticker_orig"] = child_ticker_hint or child_ty
+            if child_name_hint:
+                positions[key_dst]["name"] = child_name_hint
+
+            remaining = parent_aff_qty
+            for lot in lots_src:
+                lot_qty = float(lot.get("qty") or 0.0)
+                if lot_qty <= MIN_POSITION:
+                    continue
+                if remaining <= MIN_POSITION:
+                    break
+                take = min(lot_qty, remaining)
+                frac = take / lot_qty if lot_qty > MIN_POSITION else 0.0
+                child_qty = take * ratio
+                child_cost_eur = float(lot["cost_eur"]) * frac * alloc
+                child_cost_local = float(lot["cost_local"]) * frac * alloc
+                lot["cost_eur"] -= child_cost_eur
+                lot["cost_local"] -= child_cost_local
+                positions[key_dst]["lots"].append(
+                    {"qty": child_qty, "cost_eur": child_cost_eur, "cost_local": child_cost_local}
+                )
+                remaining -= take
             continue
 
         if not broker or qty is None or qty <= 0:
@@ -5393,7 +5525,15 @@ def main() -> None:
                     position_type = "crypto"
 
                 # Paso 2: Tipo de operación (primero, porque define qué campos se muestran)
-                if tipo_registro in ("Acciones/ETFs", "Otros"):
+                if tipo_registro == "Acciones/ETFs":
+                    op_options = [
+                        ("buy", "Compra"),
+                        ("sell", "Venta"),
+                        ("split", "Split"),
+                        ("spinoff", "Spin-off"),
+                        ("brokerTransfer", "Transferencia entre brokers"),
+                    ]
+                elif tipo_registro == "Otros":
                     op_options = [("buy", "Compra"), ("sell", "Venta"), ("split", "Split"), ("brokerTransfer", "Transferencia entre brokers")]
                 elif tipo_registro == "Opciones (Put/Call)":
                     op_options = [
@@ -5981,6 +6121,13 @@ def main() -> None:
                                         st.error(f"Error al guardar: {e}")
                 else:
                     _is_acc_split = op_type == "split" and tipo_registro in ("Acciones/ETFs", "Otros")
+                    _is_acc_spinoff = op_type == "spinoff" and tipo_registro == "Acciones/ETFs"
+                    sp_child_ticker = ""
+                    sp_child_yahoo = ""
+                    sp_child_name = ""
+                    sp_child_isin = ""
+                    sp_qty_recv = 0.0
+                    sp_alloc_pct = 0.0
                     c1, c2, c3 = st.columns(3)
                     with c1:
                         op_date = st.date_input("Fecha", key="op_date_nuevo")
@@ -6025,6 +6172,111 @@ def main() -> None:
                             help="Por cada título **antes** del split, cuántos tienes **después**. No es «cuántas acciones tengo en total».",
                         )
                         op_quantity = _to_float(_qty_str, 0.0)
+                        op_price = 0.0
+                        op_total_local = 0.0
+                        precio_o_total = "Precio unitario"
+                        mod_fx = False
+                        op_exchange_rate = 1.0
+                        auto_fx = False
+                        op_commission = 0.0
+                        op_taxes = 0.0
+                        op_commission_ccy = (position_currency or "EUR").strip() or "EUR"
+                        op_taxes_ccy = op_commission_ccy
+                        op_dest_ret = 0.0
+                    elif _is_acc_spinoff:
+                        st.info(
+                            "**Spin-off:** reparte la base de coste entre la posición padre y la nueva posición hija. "
+                            "No genera plusvalía/minusvalía en el momento del evento."
+                        )
+                        if "op_qty_nuevo_pending_fill" in st.session_state:
+                            st.session_state["op_qty_nuevo"] = st.session_state.pop("op_qty_nuevo_pending_fill")
+                        sq1, sq2 = st.columns(2)
+                        with sq1:
+                            _qty_str = st.text_input(
+                                "Títulos afectados (padre)",
+                                placeholder="0 o 0,0000",
+                                key="op_qty_nuevo",
+                                help="Cantidad de títulos de la posición padre que participan en el spin-off.",
+                            )
+                            op_quantity = _to_float(_qty_str, 0.0)
+                            if not es_posicion_nueva and sel_pos not in ("—— Elige posición ——", "➕ Nueva posición", "——"):
+                                _br_sp = str(op_broker or "").strip()
+                                _yh_sp = str(position_yahoo or "").strip()
+                                _qsp = qty_en_cartera_broker_yahoo(
+                                    tipo_registro,
+                                    _br_sp,
+                                    _yh_sp,
+                                    _pos_nueva_op_acc,
+                                    _pos_nueva_op_fon,
+                                    _pos_nueva_op_crip,
+                                )
+                                if _qsp > MIN_POSITION and _br_sp and _yh_sp:
+                                    if st.button(
+                                        "Todas",
+                                        key="btn_spinoff_todas",
+                                        help=f"Rellenar con la posición completa en esta cuenta ({_qsp:g})",
+                                    ):
+                                        st.session_state["op_qty_nuevo_pending_fill"] = _format_qty_streamlit_form(_qsp)
+                                        st.rerun()
+                        with sq2:
+                            _recv_str = st.text_input(
+                                "Títulos recibidos (hija)",
+                                placeholder="0 o 0,0000",
+                                key="sp_qty_recv_nuevo",
+                            )
+                            sp_qty_recv = _to_float(_recv_str, 0.0)
+                        sc1, sc2, sc3 = st.columns(3)
+                        with sc1:
+                            sp_dest_mode = st.radio(
+                                "Posición hija",
+                                ["Elegir existente", "Crear nueva"],
+                                horizontal=True,
+                                key="sp_dest_mode_nuevo",
+                            )
+                        with sc2:
+                            _alloc_str = st.text_input(
+                                "% base coste para posición hija",
+                                placeholder="0-100",
+                                key="sp_alloc_pct_nuevo",
+                                help="Formato porcentaje 0–100. Ejemplo: 20 = 20% del coste pasa a la posición hija.",
+                            )
+                            sp_alloc_pct = _to_float(_alloc_str, 0.0)
+                        with sc3:
+                            st.caption("Porcentaje que permanece en padre")
+                            st.metric("Padre (%)", f"{max(0.0, 100.0 - sp_alloc_pct):.4f}")
+
+                        if sp_dest_mode == "Elegir existente":
+                            sp_options = ["—— Elige posición hija ——"]
+                            if not catalog_activo.empty:
+                                for _, rr in catalog_activo.iterrows():
+                                    _lab = f"{rr.get('ticker', '')} | {rr.get('name', '')}"
+                                    sp_options.append(_lab)
+                            sp_sel = st.selectbox("Posición hija (existente)", sp_options, key="sp_dest_sel_nuevo")
+                            if sp_sel != "—— Elige posición hija ——" and not catalog_activo.empty:
+                                idx_sp = sp_options.index(sp_sel) - 1
+                                if 0 <= idx_sp < len(catalog_activo):
+                                    rr = catalog_activo.iloc[idx_sp]
+                                    sp_child_ticker = str(rr.get("ticker") or "")
+                                    sp_child_yahoo = str(rr.get("ticker_Yahoo") or sp_child_ticker)
+                                    sp_child_name = str(rr.get("name") or sp_child_ticker)
+                                    sp_child_isin = _norm_isin_field(rr.get("isin")) or _lookup_isin_for_ticker_yahoo(sp_child_yahoo) or ""
+                        else:
+                            sn1, sn2, sn3 = st.columns(3)
+                            with sn1:
+                                sp_child_ticker = st.text_input("Ticker hija", key="sp_child_ticker_nuevo", placeholder="Ej. DGSP")
+                                sp_child_yahoo = st.text_input("Ticker Yahoo hija", key="sp_child_yahoo_nuevo", placeholder="Si difiere del ticker")
+                            with sn2:
+                                sp_child_name = st.text_input("Nombre hija", key="sp_child_name_nuevo", placeholder="Nombre del activo")
+                                sp_child_isin = st.text_input(
+                                    "ISIN hija (obligatorio)",
+                                    key="sp_child_isin_nuevo",
+                                    placeholder="Ej. FR0000000000",
+                                )
+                            with sn3:
+                                _ratio = (sp_qty_recv / op_quantity) if op_quantity > 0 else 0.0
+                                st.caption("Ratio hija/padre")
+                                st.metric("Ratio", f"{_ratio:.6f}")
+
                         op_price = 0.0
                         op_total_local = 0.0
                         precio_o_total = "Precio unitario"
@@ -6186,7 +6438,104 @@ def main() -> None:
                                 )
 
                     if st.button("Guardar operación", type="primary", key="guardar_nuevo"):
-                        if _is_acc_split:
+                        if _is_acc_spinoff:
+                            if es_posicion_nueva:
+                                st.error(
+                                    "El spin-off aplica sobre una posición **ya existente**: elige «Sí, elegir de la lista» y la posición padre."
+                                )
+                            elif sel_pos in ("—— Elige posición ——", "——") or not sel_pos:
+                                st.error("Elige la posición padre de la lista.")
+                            elif op_quantity <= 0:
+                                st.error("Indica títulos afectados (padre) mayores que 0.")
+                            elif sp_qty_recv <= 0:
+                                st.error("Indica títulos recibidos (hija) mayores que 0.")
+                            elif sp_alloc_pct < 0 or sp_alloc_pct > 100:
+                                st.error("El % para la posición hija debe estar entre 0 y 100.")
+                            else:
+                                _ty_sp = (position_yahoo or position_ticker or "").strip()
+                                _iso_parent = _resolve_movimiento_isin(
+                                    "Acciones/ETFs",
+                                    es_posicion_nueva,
+                                    position_isin,
+                                    _ty_sp,
+                                    position_type,
+                                )
+                                if not _iso_parent:
+                                    st.error(
+                                        f"El **ISIN** es obligatorio para spin-off de acciones/ETF. "
+                                        f"Añádelo en **Catálogo** para `{_ty_sp}`."
+                                    )
+                                else:
+                                    _child_ref = (sp_child_yahoo or sp_child_ticker or "").strip()
+                                    _iso_child = _norm_isin_field(sp_child_isin) or (
+                                        _lookup_isin_for_ticker_yahoo(_child_ref) if _child_ref else ""
+                                    )
+                                    if not _iso_child:
+                                        st.error(
+                                            "El **ISIN** de la posición hija es obligatorio. "
+                                            "Elígela del catálogo con ISIN o créala indicando ISIN."
+                                        )
+                                    elif not _child_ref:
+                                        st.error("Indica ticker/ticker Yahoo de la posición hija.")
+                                    else:
+                                        if hasattr(op_time, "strftime"):
+                                            time_str = op_time.strftime("%H:%M:%S")
+                                        else:
+                                            _t = str(op_time).strip() if op_time else "00:00:00"
+                                            if ":" in _t:
+                                                parts = _t.split(":")
+                                                time_str = f"{parts[0].zfill(2)}:{parts[1].zfill(2)}:00" if len(parts) == 2 else f"{parts[0].zfill(2)}:{parts[1].zfill(2)}:{str(parts[2]).zfill(2)}"
+                                            else:
+                                                time_str = _t or "00:00:00"
+                                        date_str = op_date.strftime("%Y-%m-%d") if hasattr(op_date, "strftime") else str(op_date)
+                                        new_row_spinoff = {
+                                            "date": date_str,
+                                            "time": time_str,
+                                            "ticker": position_ticker or position_yahoo,
+                                            "ticker_Yahoo": position_yahoo or position_ticker,
+                                            "isin": _iso_parent,
+                                            "name": position_name or position_ticker,
+                                            "positionType": position_type,
+                                            "positionCountry": position_country or "",
+                                            "positionCurrency": position_currency,
+                                            "positionExchange": position_exchange or "",
+                                            "broker": op_broker,
+                                            "type": "spinoff",
+                                            "positionNumber": op_quantity,
+                                            "price": 0.0,
+                                            "comission": 0.0,
+                                            "comissionCurrency": op_commission_ccy,
+                                            "destinationRetentionBaseCurrency": "",
+                                            "taxes": 0.0,
+                                            "taxesCurrency": op_taxes_ccy,
+                                            "exchangeRate": 1.0,
+                                            "positionQuantity": "",
+                                            "autoFx": "No",
+                                            "switchBuyPosition": _child_ref,
+                                            "switchBuyPositionType": sp_child_name,
+                                            "switchBuyPositionNumber": "",
+                                            "switchBuyExchangeRate": "",
+                                            "switchBuyBroker": "",
+                                            "spinOffBuyPosition": _iso_child,
+                                            "spinOffBuyPositionNumber": sp_qty_recv,
+                                            "spinOffBuyPositionAllocation": sp_alloc_pct,
+                                            "brokerTransferNewBroker": "",
+                                            "total": 0.0,
+                                            "totalBaseCurrency": 0.0,
+                                            "totalWithComission": 0.0,
+                                            "totalWithComissionBaseCurrency": 0.0,
+                                        }
+                                        try:
+                                            append_operation(new_row_spinoff)
+                                            load_data.clear()
+                                            if "nuevo_form_abierto" in st.session_state:
+                                                st.session_state["nuevo_form_abierto"] = False
+                                            _clear_form_nueva_operacion()
+                                            st.success("Spin-off registrado.")
+                                            st.rerun()
+                                        except Exception as e:
+                                            st.error(f"Error al guardar: {e}")
+                        elif _is_acc_split:
                             if es_posicion_nueva:
                                 st.error(
                                     "El split aplica sobre una posición **ya existente**: elige «Sí, elegir de la lista» y la posición."
