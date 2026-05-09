@@ -74,6 +74,73 @@ def compute_fifo_all(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.D
                         lote["Precio medio €"] /= factor
             continue
 
+        # -------- SPIN-OFF: redistribuye coste del padre y crea lotes en la hija --------
+        if tipo_lower == "spinoff":
+            if broker is None:
+                continue
+            parent_aff_qty = abs(_to_float(_safe_get(row, "positionNumber"), 0.0))
+            child_qty_total = _to_float(_safe_get(row, "spinOffBuyPositionNumber"), 0.0)
+            alloc_pct = _to_float(_safe_get(row, "spinOffBuyPositionAllocation"), 0.0)
+            alloc = max(0.0, min(1.0, alloc_pct / 100.0))
+            if parent_aff_qty <= MIN_POSITION or child_qty_total <= MIN_POSITION:
+                continue
+
+            key_src = _fifo_queue_key_stocks(row, broker, key_ticker, cat_cache)
+            if key_src not in lots_by_key:
+                continue
+            lots_src = lots_by_key[key_src]
+            if not lots_src:
+                continue
+
+            child_ref = str(_safe_get(row, "spinOffBuyPosition") or "").strip()
+            child_ticker_hint = str(_safe_get(row, "switchBuyPosition") or "").strip()
+            child_name_hint = str(_safe_get(row, "switchBuyPositionType") or "").strip()
+            child_isin = _fifo_resolve_isin_row(
+                pd.Series({"isin": child_ref}),
+                child_ref,
+                child_ref,
+                cat_cache,
+            )
+            child_ty = child_ticker_hint or child_ref
+            child_row = row.copy()
+            child_row["ticker_Yahoo"] = child_ty
+            child_row["ticker"] = child_ty
+            child_row["isin"] = child_isin
+            key_dst = _fifo_queue_key_stocks(child_row, broker, child_ty, cat_cache)
+            if key_dst not in lots_by_key:
+                lots_by_key[key_dst] = []
+
+            ratio = child_qty_total / parent_aff_qty
+            remaining = parent_aff_qty
+            for lote in lots_src:
+                lot_qty = float(lote["Cantidad"])
+                if lot_qty <= MIN_POSITION:
+                    continue
+                if remaining <= MIN_POSITION:
+                    break
+                take = min(lot_qty, remaining)
+                frac = take / lot_qty if lot_qty > MIN_POSITION else 0.0
+                coste_take = lot_qty * float(lote["Precio medio €"]) * frac
+                coste_child = coste_take * alloc
+                child_qty = take * ratio
+                lote["Precio medio €"] = ((lot_qty * float(lote["Precio medio €"])) - coste_child) / lot_qty
+                isin_child = _fifo_resolve_isin_row(child_row, child_ty, child_ty, cat_cache)
+                lots_by_key[key_dst].append(
+                    {
+                        "Broker": broker,
+                        "Ticker": child_ty,
+                        "Ticker_Yahoo": child_ty,
+                        "ISIN": isin_child,
+                        "Nombre": child_name_hint or child_ty,
+                        "Fecha origen": fecha,
+                        "Cantidad": float(child_qty),
+                        "Precio medio €": (coste_child / child_qty) if child_qty > MIN_POSITION else 0.0,
+                        "Tipo activo": tipo_activo,
+                    }
+                )
+                remaining -= take
+            continue
+
         if broker is None or pd.isna(qty):
             continue
         qty_f = float(qty)
