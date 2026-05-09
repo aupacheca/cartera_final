@@ -155,12 +155,27 @@ def _ensure_movimientos_criptos_schema():
         conn.commit()
 
 
+def _ensure_movimientos_description_column():
+    """Añade columna description en movimientos/movimientos_fondos (BDs antiguas)."""
+    with _get_db() as conn:
+        for tbl in ("movimientos", "movimientos_fondos"):
+            try:
+                cur = conn.execute(f'PRAGMA table_info("{tbl}")')
+                names = {row[1] for row in cur.fetchall()}
+                if names and "description" not in names:
+                    conn.execute(f'ALTER TABLE "{tbl}" ADD COLUMN "description" TEXT')
+            except sqlite3.OperationalError:
+                pass
+        conn.commit()
+
+
 def _init_db():
     """Crea la tabla movimientos si no existe."""
     cols_sql = ", ".join(f'"{c}" TEXT' for c in MOVIMIENTOS_COLUMNS)
     with _get_db() as conn:
         conn.execute(f"CREATE TABLE IF NOT EXISTS movimientos ({cols_sql})")
     _ensure_movimientos_isin_column()
+    _ensure_movimientos_description_column()
 
 
 def _init_db_cartera_snapshot_mes():
@@ -700,6 +715,7 @@ def _init_db_fondos():
     with _get_db() as conn:
         conn.execute(f"CREATE TABLE IF NOT EXISTS movimientos_fondos ({cols_sql})")
     _ensure_movimientos_isin_column()
+    _ensure_movimientos_description_column()
 
 
 def _migrate_fondos_csv_to_db():
@@ -5529,6 +5545,8 @@ def main() -> None:
                     op_options = [
                         ("buy", "Compra"),
                         ("sell", "Venta"),
+                        ("putAssignment", "Asignación de put"),
+                        ("callAssignment", "Ejercicio/asignación de call"),
                         ("split", "Split"),
                         ("spinoff", "Spin-off"),
                         ("brokerTransfer", "Transferencia entre brokers"),
@@ -5551,6 +5569,15 @@ def main() -> None:
                     format_func=lambda x: dict(op_options).get(x, x),
                     key="op_type_nuevo",
                 )
+                if tipo_registro == "Acciones/ETFs" and op_type in ("putAssignment", "callAssignment") and not catalog_activo.empty and "positionType" in catalog_activo.columns:
+                    _pt = catalog_activo["positionType"].astype(str).str.strip().str.lower()
+                    catalog_activo = catalog_activo[_pt.isin(["stock", "etf"])].copy()
+                op_description = st.text_area(
+                    "Observación (opcional)",
+                    key="op_description_nuevo",
+                    placeholder="Notas internas de la operación",
+                    height=80,
+                ).strip()
 
                 # Formularios con selector propio (sin Posición genérica): traspaso, transferencias, permuta
                 _form_propio = (
@@ -5843,6 +5870,7 @@ def main() -> None:
                                                 "spinOffBuyPosition": "", "spinOffBuyPositionNumber": "", "spinOffBuyPositionAllocation": "",
                                                 "brokerTransferNewBroker": "",
                                                 "total": valor_eur, "totalBaseCurrency": valor_eur, "totalWithComission": valor_eur, "totalWithComissionBaseCurrency": valor_eur,
+                                                "description": op_description,
                                             }
                                             yahoo_d_row = str(rd.get("ticker_Yahoo") or ticker_d).strip() if tf_destino != "➕ Nuevo fondo destino" else ticker_d
                                             row_switchbuy = {
@@ -5857,6 +5885,7 @@ def main() -> None:
                                                 "spinOffBuyPosition": "", "spinOffBuyPositionNumber": "", "spinOffBuyPositionAllocation": "",
                                                 "brokerTransferNewBroker": "",
                                                 "total": valor_eur, "totalBaseCurrency": valor_eur, "totalWithComission": valor_eur, "totalWithComissionBaseCurrency": valor_eur,
+                                                "description": op_description,
                                             }
                                             try:
                                                 append_operation_fondos(row_switch)
@@ -5932,6 +5961,7 @@ def main() -> None:
                                         "spinOffBuyPosition": "", "spinOffBuyPositionNumber": "", "spinOffBuyPositionAllocation": "",
                                         "brokerTransferNewBroker": str(bt_broker_destino).strip(),
                                         "total": 0, "totalBaseCurrency": 0, "totalWithComission": 0, "totalWithComissionBaseCurrency": 0,
+                                        "description": op_description,
                                     }
                                     try:
                                         append_operation(row_bt)
@@ -5996,7 +6026,7 @@ def main() -> None:
                                         "spinOffBuyPosition": "", "spinOffBuyPositionNumber": "", "spinOffBuyPositionAllocation": "",
                                         "brokerTransferNewBroker": broker_dest,
                                         "total": 0, "totalBaseCurrency": 0, "totalWithComission": 0, "totalWithComissionBaseCurrency": 0,
-                                        "positionCustomType": "", "description": "",
+                                        "positionCustomType": "", "description": op_description,
                                     }
                                 try:
                                     if com_val > 0:
@@ -6094,7 +6124,7 @@ def main() -> None:
                                         "spinOffBuyPosition": "", "spinOffBuyPositionNumber": "", "spinOffBuyPositionAllocation": "",
                                         "brokerTransferNewBroker": "",
                                         "total": valor_eur, "totalBaseCurrency": valor_eur, "totalWithComission": valor_eur, "totalWithComissionBaseCurrency": valor_eur,
-                                        "positionCustomType": "", "description": "",
+                                        "positionCustomType": "", "description": op_description,
                                     }
                                     row_switchbuy = {
                                         "date": date_str, "time": time_str,
@@ -6108,7 +6138,7 @@ def main() -> None:
                                         "spinOffBuyPosition": "", "spinOffBuyPositionNumber": "", "spinOffBuyPositionAllocation": "",
                                         "brokerTransferNewBroker": "",
                                         "total": valor_eur, "totalBaseCurrency": valor_eur, "totalWithComission": valor_eur, "totalWithComissionBaseCurrency": valor_eur,
-                                        "positionCustomType": "", "description": "",
+                                        "positionCustomType": "", "description": op_description,
                                     }
                                     try:
                                         append_operation_criptos(row_switch)
@@ -6122,12 +6152,24 @@ def main() -> None:
                 else:
                     _is_acc_split = op_type == "split" and tipo_registro in ("Acciones/ETFs", "Otros")
                     _is_acc_spinoff = op_type == "spinoff" and tipo_registro == "Acciones/ETFs"
+                    _is_acc_put_assignment = op_type == "putAssignment" and tipo_registro == "Acciones/ETFs"
+                    _is_acc_call_assignment = op_type == "callAssignment" and tipo_registro == "Acciones/ETFs"
                     sp_child_ticker = ""
                     sp_child_yahoo = ""
                     sp_child_name = ""
                     sp_child_isin = ""
                     sp_qty_recv = 0.0
                     sp_alloc_pct = 0.0
+                    pa_strike = 0.0
+                    pa_premium_gross = 0.0
+                    pa_option_commission = 0.0
+                    pa_assignment_commission = 0.0
+                    pa_option_ref = ""
+                    ca_strike = 0.0
+                    ca_premium_gross = 0.0
+                    ca_option_commission = 0.0
+                    ca_assignment_commission = 0.0
+                    ca_option_ref = ""
                     c1, c2, c3 = st.columns(3)
                     with c1:
                         op_date = st.date_input("Fecha", key="op_date_nuevo")
@@ -6284,6 +6326,200 @@ def main() -> None:
                         op_exchange_rate = 1.0
                         auto_fx = False
                         op_commission = 0.0
+                        op_taxes = 0.0
+                        op_commission_ccy = (position_currency or "EUR").strip() or "EUR"
+                        op_taxes_ccy = op_commission_ccy
+                        op_dest_ret = 0.0
+                    elif _is_acc_put_assignment:
+                        st.info(
+                            "**Asignación de put:** registra una compra de acciones con coste fiscal neto. "
+                            "La prima neta (prima - comisión opción) reduce el strike; la comisión de asignación se suma al coste."
+                        )
+                        pq1, pq2 = st.columns(2)
+                        with pq1:
+                            _qty_str = st.text_input(
+                                "Títulos asignados",
+                                placeholder="100",
+                                key="op_qty_nuevo",
+                                help="Normalmente 100 por contrato, salvo ajustes corporativos.",
+                            )
+                            op_quantity = _to_float(_qty_str, 0.0)
+                            _strike_str = st.text_input(
+                                f"Strike / precio de ejecución ({position_currency})",
+                                placeholder="0 o 0,00",
+                                key="pa_strike_nuevo",
+                            )
+                            pa_strike = _to_float(_strike_str, 0.0)
+                        with pq2:
+                            _prem_str = st.text_input(
+                                f"Prima cobrada total ({position_currency})",
+                                placeholder="0 o 0,00",
+                                key="pa_premium_gross_nuevo",
+                            )
+                            pa_premium_gross = _to_float(_prem_str, 0.0)
+                            _opc_str = st.text_input(
+                                f"Comisión opción ({position_currency})",
+                                placeholder="0 o 0,00",
+                                key="pa_option_commission_nuevo",
+                            )
+                            pa_option_commission = _to_float(_opc_str, 0.0)
+                            _asg_str = st.text_input(
+                                f"Comisión asignación/compra ({position_currency})",
+                                placeholder="0 o 0,00",
+                                key="pa_assignment_commission_nuevo",
+                            )
+                            pa_assignment_commission = _to_float(_asg_str, 0.0)
+                            pa_option_ref = st.text_input(
+                                "Referencia put asignada (opcional)",
+                                key="pa_option_ref_nuevo",
+                                placeholder="Ej. ZTS May15'26 105 Put",
+                            ).strip()
+
+                        pa_premium_net = pa_premium_gross - pa_option_commission
+                        pa_total_net_local = (op_quantity * pa_strike) - pa_premium_net + pa_assignment_commission
+                        op_price = (pa_total_net_local / op_quantity) if op_quantity else 0.0
+                        op_total_local = pa_total_net_local
+
+                        st.info(
+                            "Cómo proceder en esta operación:\n"
+                            "1) Selecciona la **acción/ETF** asignada (no la put).\n"
+                            "2) Indica strike, prima y comisiones de la opción/asignación.\n"
+                            "3) Si esta put terminó asignada, elimina/no registres su `Venta de prima` por separado para evitar doble cómputo fiscal.\n"
+                            "4) Usa `Referencia put asignada` y `Observación` para trazabilidad."
+                        )
+                        m1, m2, m3 = st.columns(3)
+                        with m1:
+                            st.metric("Prima neta", f"{pa_premium_net:,.2f}".replace(",", " ").replace(".", ","))
+                        with m2:
+                            st.metric("Coste fiscal total", f"{pa_total_net_local:,.2f}".replace(",", " ").replace(".", ","))
+                        with m3:
+                            st.metric("Precio fiscal por acción", f"{op_price:,.6f}".replace(",", " ").replace(".", ","))
+
+                        mod_fx = st.toggle(
+                            "Modificar tipo de cambio",
+                            value=False,
+                            key="mod_fx_nuevo",
+                            help="Desactivado: tipo BCE para la fecha de asignación. Activado: puedes introducir otro valor.",
+                        )
+                        op_exchange_rate = 1.0
+                        if position_currency == "EUR":
+                            op_exchange_rate = 1.0
+                        else:
+                            if not mod_fx:
+                                op_exchange_rate = get_fx_rate_for_date(position_currency, op_date)
+                                if math.isnan(op_exchange_rate) or op_exchange_rate <= 0:
+                                    op_exchange_rate = 1.0
+                                st.caption(
+                                    f"Tipo BCE (Frankfurter), EUR por 1 {position_currency}: **{op_exchange_rate:.4f}**."
+                                )
+                            else:
+                                _fx_str = st.text_input(
+                                    f"Tipo de cambio ({position_currency}/EUR)",
+                                    placeholder="1 o 0,92",
+                                    key="op_fx_nuevo",
+                                )
+                                op_exchange_rate = _to_float(_fx_str, 1.0) if (_fx_str or "").strip() else 1.0
+
+                        auto_fx = False
+                        precio_o_total = "Precio unitario"
+                        op_commission = 0.0
+                        op_taxes = 0.0
+                        op_commission_ccy = (position_currency or "EUR").strip() or "EUR"
+                        op_taxes_ccy = op_commission_ccy
+                        op_dest_ret = 0.0
+                    elif _is_acc_call_assignment:
+                        st.info(
+                            "**Ejercicio/asignación de call:** registra una venta de acciones con valor de transmisión neto. "
+                            "La prima neta (prima - comisión opción) suma al strike; la comisión de asignación se resta."
+                        )
+                        cq1, cq2 = st.columns(2)
+                        with cq1:
+                            _qty_str = st.text_input(
+                                "Títulos vendidos por ejercicio",
+                                placeholder="100",
+                                key="op_qty_nuevo",
+                                help="Normalmente 100 por contrato, salvo ajustes corporativos.",
+                            )
+                            op_quantity = _to_float(_qty_str, 0.0)
+                            _strike_str = st.text_input(
+                                f"Strike / precio de ejercicio ({position_currency})",
+                                placeholder="0 o 0,00",
+                                key="ca_strike_nuevo",
+                            )
+                            ca_strike = _to_float(_strike_str, 0.0)
+                        with cq2:
+                            _prem_str = st.text_input(
+                                f"Prima cobrada total ({position_currency})",
+                                placeholder="0 o 0,00",
+                                key="ca_premium_gross_nuevo",
+                            )
+                            ca_premium_gross = _to_float(_prem_str, 0.0)
+                            _opc_str = st.text_input(
+                                f"Comisión opción ({position_currency})",
+                                placeholder="0 o 0,00",
+                                key="ca_option_commission_nuevo",
+                            )
+                            ca_option_commission = _to_float(_opc_str, 0.0)
+                            _asg_str = st.text_input(
+                                f"Comisión ejercicio/venta ({position_currency})",
+                                placeholder="0 o 0,00",
+                                key="ca_assignment_commission_nuevo",
+                            )
+                            ca_assignment_commission = _to_float(_asg_str, 0.0)
+                            ca_option_ref = st.text_input(
+                                "Referencia call ejercida (opcional)",
+                                key="ca_option_ref_nuevo",
+                                placeholder="Ej. ZTS Jun19'26 110 Call",
+                            ).strip()
+
+                        ca_premium_net = ca_premium_gross - ca_option_commission
+                        ca_total_gross_local = (op_quantity * ca_strike) + ca_premium_net
+                        op_price = (ca_total_gross_local / op_quantity) if op_quantity else 0.0
+                        op_total_local = ca_total_gross_local
+
+                        st.info(
+                            "Cómo proceder en esta operación:\n"
+                            "1) Selecciona la **acción/ETF** vendida por ejercicio (no la call).\n"
+                            "2) Indica strike, prima y comisiones de la opción/ejercicio.\n"
+                            "3) Si esta call terminó ejercida, elimina/no registres su `Venta de prima` por separado para evitar doble cómputo fiscal.\n"
+                            "4) Usa `Referencia call ejercida` y `Observación` para trazabilidad."
+                        )
+                        m1, m2, m3 = st.columns(3)
+                        with m1:
+                            st.metric("Prima neta", f"{ca_premium_net:,.2f}".replace(",", " ").replace(".", ","))
+                        with m2:
+                            st.metric("Valor transmisión bruto", f"{ca_total_gross_local:,.2f}".replace(",", " ").replace(".", ","))
+                        with m3:
+                            st.metric("Precio de transmisión por acción", f"{op_price:,.6f}".replace(",", " ").replace(".", ","))
+
+                        mod_fx = st.toggle(
+                            "Modificar tipo de cambio",
+                            value=False,
+                            key="mod_fx_nuevo",
+                            help="Desactivado: tipo BCE para la fecha de ejercicio. Activado: puedes introducir otro valor.",
+                        )
+                        op_exchange_rate = 1.0
+                        if position_currency == "EUR":
+                            op_exchange_rate = 1.0
+                        else:
+                            if not mod_fx:
+                                op_exchange_rate = get_fx_rate_for_date(position_currency, op_date)
+                                if math.isnan(op_exchange_rate) or op_exchange_rate <= 0:
+                                    op_exchange_rate = 1.0
+                                st.caption(
+                                    f"Tipo BCE (Frankfurter), EUR por 1 {position_currency}: **{op_exchange_rate:.4f}**."
+                                )
+                            else:
+                                _fx_str = st.text_input(
+                                    f"Tipo de cambio ({position_currency}/EUR)",
+                                    placeholder="1 o 0,92",
+                                    key="op_fx_nuevo",
+                                )
+                                op_exchange_rate = _to_float(_fx_str, 1.0) if (_fx_str or "").strip() else 1.0
+
+                        auto_fx = False
+                        precio_o_total = "Precio unitario"
+                        op_commission = ca_assignment_commission
                         op_taxes = 0.0
                         op_commission_ccy = (position_currency or "EUR").strip() or "EUR"
                         op_taxes_ccy = op_commission_ccy
@@ -6524,6 +6760,7 @@ def main() -> None:
                                             "totalBaseCurrency": 0.0,
                                             "totalWithComission": 0.0,
                                             "totalWithComissionBaseCurrency": 0.0,
+                                            "description": op_description,
                                         }
                                         try:
                                             append_operation(new_row_spinoff)
@@ -6605,6 +6842,7 @@ def main() -> None:
                                         "totalBaseCurrency": 0.0,
                                         "totalWithComission": 0.0,
                                         "totalWithComissionBaseCurrency": 0.0,
+                                        "description": op_description,
                                     }
                                     try:
                                         append_operation(new_row_split)
@@ -6613,6 +6851,203 @@ def main() -> None:
                                             st.session_state["nuevo_form_abierto"] = False
                                         _clear_form_nueva_operacion()
                                         st.success("Split registrado.")
+                                        st.rerun()
+                                    except Exception as e:
+                                        st.error(f"Error al guardar: {e}")
+                        elif _is_acc_put_assignment:
+                            if op_quantity <= 0:
+                                st.error("Indica títulos asignados mayores que 0.")
+                            elif pa_strike <= 0:
+                                st.error("Indica un strike mayor que 0.")
+                            elif op_total_local <= 0:
+                                st.error("El coste fiscal total debe ser mayor que 0.")
+                            else:
+                                iso_final = _resolve_movimiento_isin(
+                                    tipo_registro,
+                                    es_posicion_nueva,
+                                    position_isin,
+                                    (position_yahoo or position_ticker or "").strip(),
+                                    position_type,
+                                )
+                                if not iso_final:
+                                    st.error(
+                                        "El **ISIN** es obligatorio para acciones/ETF. "
+                                        "Indícalo en el formulario (posición nueva) o complétalo en **Catálogo**."
+                                    )
+                                else:
+                                    total_base = op_total_local * (op_exchange_rate if op_exchange_rate and abs(op_exchange_rate) > 1e-9 else 1.0)
+                                    if hasattr(op_time, "strftime"):
+                                        time_str = op_time.strftime("%H:%M:%S")
+                                    else:
+                                        _t = str(op_time).strip() if op_time else "00:00:00"
+                                        if ":" in _t:
+                                            parts = _t.split(":")
+                                            time_str = f"{parts[0].zfill(2)}:{parts[1].zfill(2)}:00" if len(parts) == 2 else f"{parts[0].zfill(2)}:{parts[1].zfill(2)}:{str(parts[2]).zfill(2)}"
+                                        else:
+                                            time_str = _t or "00:00:00"
+                                    date_str = op_date.strftime("%Y-%m-%d") if hasattr(op_date, "strftime") else str(op_date)
+                                    new_row_assign = {
+                                        "date": date_str,
+                                        "time": time_str,
+                                        "ticker": position_ticker or position_yahoo,
+                                        "ticker_Yahoo": position_yahoo or position_ticker,
+                                        "isin": iso_final,
+                                        "name": position_name or position_ticker,
+                                        "positionType": position_type,
+                                        "positionCountry": position_country or "",
+                                        "positionCurrency": position_currency,
+                                        "positionExchange": position_exchange or "",
+                                        "broker": op_broker,
+                                        "type": "buy",
+                                        "positionNumber": op_quantity,
+                                        "price": op_price,
+                                        "comission": 0.0,
+                                        "comissionCurrency": op_commission_ccy,
+                                        "destinationRetentionBaseCurrency": "",
+                                        "taxes": 0.0,
+                                        "taxesCurrency": op_taxes_ccy,
+                                        "exchangeRate": op_exchange_rate,
+                                        "positionQuantity": "",
+                                        "autoFx": "No",
+                                        "switchBuyPosition": "",
+                                        "switchBuyPositionType": "",
+                                        "switchBuyPositionNumber": "",
+                                        "switchBuyExchangeRate": "",
+                                        "switchBuyBroker": "",
+                                        "spinOffBuyPosition": "",
+                                        "spinOffBuyPositionNumber": "",
+                                        "spinOffBuyPositionAllocation": "",
+                                        "brokerTransferNewBroker": "",
+                                        "total": op_total_local,
+                                        "totalBaseCurrency": total_base,
+                                        "totalWithComission": op_total_local,
+                                        "totalWithComissionBaseCurrency": total_base,
+                                        "description": (
+                                            f"[PUT asignada] {pa_option_ref}"
+                                            + (f" | {op_description}" if op_description else "")
+                                        ).strip(" |")
+                                        if pa_option_ref
+                                        else op_description,
+                                    }
+                                    try:
+                                        append_operation(new_row_assign)
+                                        load_data.clear()
+                                        yk = (position_yahoo or position_ticker or "").strip()
+                                        if yk and iso_final:
+                                            _init_instrument_catalog()
+                                            with _get_db() as conn:
+                                                conn.execute(
+                                                    "DELETE FROM instrument_catalog WHERE ticker_Yahoo = ?",
+                                                    (yk,),
+                                                )
+                                                conn.execute(
+                                                    "INSERT INTO instrument_catalog (ticker_Yahoo, isin) VALUES (?, ?)",
+                                                    (yk, iso_final),
+                                                )
+                                                conn.commit()
+                                        if "nuevo_form_abierto" in st.session_state:
+                                            st.session_state["nuevo_form_abierto"] = False
+                                        _clear_form_nueva_operacion()
+                                        st.success("Asignación de put registrada como compra neta (sin doble cómputo de prima).")
+                                        st.rerun()
+                                    except Exception as e:
+                                        st.error(f"Error al guardar: {e}")
+                        elif _is_acc_call_assignment:
+                            if op_quantity <= 0:
+                                st.error("Indica títulos vendidos mayores que 0.")
+                            elif ca_strike <= 0:
+                                st.error("Indica un strike mayor que 0.")
+                            elif op_total_local <= 0:
+                                st.error("El valor de transmisión bruto debe ser mayor que 0.")
+                            else:
+                                iso_final = _resolve_movimiento_isin(
+                                    tipo_registro,
+                                    es_posicion_nueva,
+                                    position_isin,
+                                    (position_yahoo or position_ticker or "").strip(),
+                                    position_type,
+                                )
+                                if not iso_final:
+                                    st.error(
+                                        "El **ISIN** es obligatorio para acciones/ETF. "
+                                        "Indícalo en el formulario (posición nueva) o complétalo en **Catálogo**."
+                                    )
+                                else:
+                                    rec = _recalc_totals(
+                                        float(op_quantity or 0),
+                                        float(op_price or 0),
+                                        float(op_commission or 0),
+                                        0.0,
+                                        float(op_exchange_rate or 1.0),
+                                        str(position_currency or "EUR"),
+                                        str(op_commission_ccy or ""),
+                                        str(op_taxes_ccy or ""),
+                                        tipo="sell",
+                                    )
+                                    total_local = rec["total"]
+                                    total_base = rec["totalBaseCurrency"]
+                                    total_with_comm_local = rec["totalWithComission"]
+                                    total_with_comm_base = rec["totalWithComissionBaseCurrency"]
+                                    if hasattr(op_time, "strftime"):
+                                        time_str = op_time.strftime("%H:%M:%S")
+                                    else:
+                                        _t = str(op_time).strip() if op_time else "00:00:00"
+                                        if ":" in _t:
+                                            parts = _t.split(":")
+                                            time_str = f"{parts[0].zfill(2)}:{parts[1].zfill(2)}:00" if len(parts) == 2 else f"{parts[0].zfill(2)}:{parts[1].zfill(2)}:{str(parts[2]).zfill(2)}"
+                                        else:
+                                            time_str = _t or "00:00:00"
+                                    date_str = op_date.strftime("%Y-%m-%d") if hasattr(op_date, "strftime") else str(op_date)
+                                    new_row_call_assign = {
+                                        "date": date_str,
+                                        "time": time_str,
+                                        "ticker": position_ticker or position_yahoo,
+                                        "ticker_Yahoo": position_yahoo or position_ticker,
+                                        "isin": iso_final,
+                                        "name": position_name or position_ticker,
+                                        "positionType": position_type,
+                                        "positionCountry": position_country or "",
+                                        "positionCurrency": position_currency,
+                                        "positionExchange": position_exchange or "",
+                                        "broker": op_broker,
+                                        "type": "sell",
+                                        "positionNumber": op_quantity,
+                                        "price": op_price,
+                                        "comission": op_commission,
+                                        "comissionCurrency": op_commission_ccy,
+                                        "destinationRetentionBaseCurrency": "",
+                                        "taxes": 0.0,
+                                        "taxesCurrency": op_taxes_ccy,
+                                        "exchangeRate": op_exchange_rate,
+                                        "positionQuantity": "",
+                                        "autoFx": "No",
+                                        "switchBuyPosition": "",
+                                        "switchBuyPositionType": "",
+                                        "switchBuyPositionNumber": "",
+                                        "switchBuyExchangeRate": "",
+                                        "switchBuyBroker": "",
+                                        "spinOffBuyPosition": "",
+                                        "spinOffBuyPositionNumber": "",
+                                        "spinOffBuyPositionAllocation": "",
+                                        "brokerTransferNewBroker": "",
+                                        "total": total_local,
+                                        "totalBaseCurrency": total_base,
+                                        "totalWithComission": total_with_comm_local,
+                                        "totalWithComissionBaseCurrency": total_with_comm_base,
+                                        "description": (
+                                            f"[CALL ejercida] {ca_option_ref}"
+                                            + (f" | {op_description}" if op_description else "")
+                                        ).strip(" |")
+                                        if ca_option_ref
+                                        else op_description,
+                                    }
+                                    try:
+                                        append_operation(new_row_call_assign)
+                                        load_data.clear()
+                                        if "nuevo_form_abierto" in st.session_state:
+                                            st.session_state["nuevo_form_abierto"] = False
+                                        _clear_form_nueva_operacion()
+                                        st.success("Ejercicio/asignación de call registrado como venta neta (sin doble cómputo de prima).")
                                         st.rerun()
                                     except Exception as e:
                                         st.error(f"Error al guardar: {e}")
@@ -6705,6 +7140,7 @@ def main() -> None:
                                     "totalBaseCurrency": total_base,
                                     "totalWithComission": total_with_comm_local,
                                     "totalWithComissionBaseCurrency": total_with_comm_base,
+                                    "description": op_description,
                                 }
                                 try:
                                     if position_type == "fund":
@@ -6714,7 +7150,7 @@ def main() -> None:
                                         row_crip = {c: new_row.get(c, "") for c in MOVIMIENTOS_COLUMNS}
                                         row_crip["positionType"] = "crypto"
                                         row_crip["positionCustomType"] = ""
-                                        row_crip["description"] = ""
+                                        row_crip["description"] = op_description
                                         yahoo_arg = "" if es_posicion_nueva else row_crip.get("ticker_Yahoo", "")
                                         row_crip["ticker_Yahoo"] = _crypto_ticker_yahoo(row_crip.get("ticker", ""), yahoo_arg)
                                         append_operation_criptos(row_crip)
