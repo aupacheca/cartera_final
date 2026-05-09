@@ -26,6 +26,7 @@ MOVIMIENTOS_COLUMNS = [
     "switchBuyPositionNumber", "switchBuyExchangeRate", "switchBuyBroker", "spinOffBuyPosition",
     "spinOffBuyPositionNumber", "spinOffBuyPositionAllocation", "brokerTransferNewBroker",
     "total", "totalBaseCurrency", "totalWithComission", "totalWithComissionBaseCurrency",
+    "description",
 ]
 
 MOVIMIENTOS_CRIPTOS_COLUMNS = [
