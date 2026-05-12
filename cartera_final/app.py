@@ -38,6 +38,7 @@ from filios_core.constants import (
     MIN_POSITION,
     MOVIMIENTOS_COLUMNS,
     MOVIMIENTOS_CRIPTOS_COLUMNS,
+    POSITION_FORM_CURRENCIES,
 )
 from filios_core.db import get_db as _get_db
 from filios_core.fifo import (
@@ -5491,7 +5492,9 @@ def main() -> None:
             catalogs_currencies.extend(catalog["positionCurrency"].dropna().astype(str).str.strip().unique().tolist())
         if not catalog_fondos.empty and "positionCurrency" in catalog_fondos.columns:
             catalogs_currencies.extend(catalog_fondos["positionCurrency"].dropna().astype(str).str.strip().unique().tolist())
-        currencies_in_data = sorted(set(catalogs_currencies) | {"EUR"}) if catalogs_currencies else ["EUR", "USD", "GBP", "CHF"]
+        currencies_in_data = sorted(
+            set(catalogs_currencies) | set(POSITION_FORM_CURRENCIES)
+        )
 
         # Posiciones vivas por cuenta (para «Vender todo» en nueva operación)
         _pos_nueva_op_acc = compute_positions_fifo(df)
