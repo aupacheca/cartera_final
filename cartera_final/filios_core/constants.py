@@ -18,6 +18,36 @@ DIVIDENDOS_COLUMNS = [
     "netoWithReturnBaseCurrency", "originRetentionLossBaseCurrency", "description",
 ]
 
+# Monedas habituales en el formulario de operaciones (se unen a las que ya hay en cartera).
+POSITION_FORM_CURRENCIES: tuple[str, ...] = (
+    "AUD",
+    "BGN",
+    "BRL",
+    "CAD",
+    "CHF",
+    "CNY",
+    "CZK",
+    "DKK",
+    "EUR",
+    "GBP",
+    "HKD",
+    "HUF",
+    "ILS",
+    "INR",
+    "JPY",
+    "KRW",
+    "MXN",
+    "NOK",
+    "NZD",
+    "PLN",
+    "RON",
+    "SEK",
+    "SGD",
+    "TRY",
+    "USD",
+    "ZAR",
+)
+
 MOVIMIENTOS_COLUMNS = [
     "date", "time", "ticker", "ticker_Yahoo", "isin", "name", "positionType", "positionCountry",
     "positionCurrency", "positionExchange", "broker", "type", "positionNumber", "price",
