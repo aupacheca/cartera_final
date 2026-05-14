@@ -9692,6 +9692,7 @@ Los **coeficientes de actualización** y el cuadre final los calcula el **softwa
         {
             "Ticker": "first",
             "Nombre": "first",
+            "Tipo activo": "first",
             "Titulos": "sum",
             "Inversion €": "sum",
             "Valor Mercado €": "sum",
@@ -9716,20 +9717,38 @@ Los **coeficientes de actualización** y el cuadre final los calcula el **softwa
     grouped["Broker"] = "Todos" if selected == "GLOBAL" else selected
     view = grouped
 
+    # Para las métricas de cabecera, excluimos puts y calls cuando «Tipo de activo = Todos».
+    # Mantenemos las opciones en la tabla de detalle.
+    _tipos_metric = view.get("Tipo activo", pd.Series([""] * len(view), index=view.index))
+    _tipos_metric = _tipos_metric.astype(str).str.strip().str.lower()
+    _hay_opciones = bool(_tipos_metric.isin({"putoption", "calloption"}).any())
+    if tipo_sel == "Todos":
+        view_metric = view[~_tipos_metric.isin({"putoption", "calloption"})].copy()
+    else:
+        view_metric = view
+
     # Fila de métricas (4 columnas) bajo los selectores de broker
-    total_inversion = view["Inversion €"].sum()
-    total_valor = view["Valor Mercado €"].sum()
+    total_inversion = view_metric["Inversion €"].sum()
+    total_valor = view_metric["Valor Mercado €"].sum()
     total_plusvalia = total_valor - total_inversion
     total_plusvalia_pct = (
         (total_plusvalia / total_inversion * 100.0) if abs(total_inversion) > 0 else math.nan
     )
-    total_gyp_hoy = view.get("GyP hoy €", pd.Series(0.0, index=view.index)).sum()
-    total_valor_mercado = view["Valor Mercado €"].sum()
+    total_gyp_hoy = view_metric.get(
+        "GyP hoy €", pd.Series(0.0, index=view_metric.index)
+    ).sum()
+    total_valor_mercado = view_metric["Valor Mercado €"].sum()
     gyp_hoy_pct = (
         (total_gyp_hoy / total_valor_mercado * 100.0)
         if total_valor_mercado and abs(total_valor_mercado) > 0
         else math.nan
     )
+
+    if tipo_sel == "Todos" and _hay_opciones:
+        st.caption(
+            "Puts y calls se excluyen del Valor cartera, G&P totales y G&P hoy "
+            "(elige «Puts» o «Calls» para verlas)."
+        )
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
