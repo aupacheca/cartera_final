@@ -44,9 +44,7 @@ from filios_core.db import get_db as _get_db
 from filios_core.fifo import (
     _cripto_chrono_type_order,
     _fifo_queue_key_stocks,
-    _fifo_queue_key_stocks_cartera,
     _fifo_split_affected_keys_stocks,
-    _fifo_split_affected_keys_stocks_cartera,
     compute_fifo_all,
     compute_fifo_criptos,
     compute_fifo_fondos,
@@ -1869,74 +1867,64 @@ def compute_positions(df: pd.DataFrame) -> pd.DataFrame:
 
 def compute_positions_fifo(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Posiciones con FIFO en ventas y traspasos (como Filios).
-    Usa lotes internamente: buy añade lote, sell consume FIFO, transfer mueve lotes FIFO.
-    Cola por (cuenta, ISIN, divisa) cuando hay ISIN: el mismo ISIN en otro mercado/divisa
-    no se mezcla; en la misma cuenta y divisa, tickers Yahoo distintos sí unifican (evita cortos ficticios).
-    La vista fiscal sigue usando su lógica propia (_fifo_queue_key_stocks).
+    Posiciones con **FIFO global por ISIN** (criterio AEAT, igual que Filios e IBKR).
+
+    - Una sola cola FIFO por ISIN: todas las compras/ventas/traspasos comparten cola.
+    - `brokerTransfer` solo cambia el bróker del lote (los lotes consumidos siguen el orden FIFO
+      de la cola global; sus fechas originales se conservan).
+    - Las ventas consumen el lote más antiguo globalmente, independientemente del bróker
+      donde se ejecute la venta (criterio fiscal correcto AEAT).
+    - Para instrumentos sin ISIN, se mantiene la cola por (broker, ticker Yahoo).
+    - El display agrupa los lotes vivos por (Broker, Ticker_Yahoo, Divisa).
     """
-    positions: dict[tuple, dict] = {}
+    queues: dict[tuple, list[dict]] = {}
     cat_cache: dict[str, str] = {}
 
-    def ensure(key: tuple, row: pd.Series) -> None:
-        if key not in positions:
-            positions[key] = {
-                "lots": [],
-                "ticker_orig": _safe_get(row, "ticker"),
-                "name": _safe_get(row, "name") or _safe_get(row, "ticker") or "",
-                "pos_currency": _safe_get(row, "positionCurrency", "EUR"),
-                "pos_type": _safe_get(row, "positionType", ""),
-                "Broker": str(_safe_get(row, "broker") or "").strip(),
-                "Ticker_Yahoo": str(
-                    (_safe_get(row, "ticker_Yahoo") or _safe_get(row, "ticker") or "")
-                ).strip(),
-            }
-        else:
-            b = str(_safe_get(row, "broker") or "").strip()
-            if b:
-                positions[key]["Broker"] = b
-            ty = str(_safe_get(row, "ticker_Yahoo") or _safe_get(row, "ticker") or "").strip()
-            if ty:
-                positions[key]["Ticker_Yahoo"] = ty
-            to = _safe_get(row, "ticker")
-            if to:
-                positions[key]["ticker_orig"] = to
-            nm = _safe_get(row, "name")
-            if nm:
-                positions[key]["name"] = nm
-            pt = _safe_get(row, "positionType")
-            if pt:
-                positions[key]["pos_type"] = pt
+    def _key(row, broker_s: str, key_ticker: str) -> tuple:
+        return _fifo_queue_key_stocks(row, broker_s or "", key_ticker, cat_cache)
+
+    def _new_lot(qty_v: float, cost_eur_v: float, cost_local_v: float, broker_s: str, row) -> dict:
+        return {
+            "qty": float(qty_v),
+            "cost_eur": float(cost_eur_v),
+            "cost_local": float(cost_local_v),
+            "Broker": str(broker_s or "").strip(),
+            "pos_currency": str(_safe_get(row, "positionCurrency", "EUR") or "EUR"),
+            "Ticker_Yahoo": str(
+                _safe_get(row, "ticker_Yahoo") or _safe_get(row, "ticker") or ""
+            ).strip(),
+            "ticker_orig": str(_safe_get(row, "ticker") or "").strip(),
+            "name": str(_safe_get(row, "name") or _safe_get(row, "ticker") or "").strip(),
+            "pos_type": str(_safe_get(row, "positionType", "") or "").strip(),
+        }
 
     for _, row in df.iterrows():
-        broker = _safe_get(row, "broker")
+        broker_raw = _safe_get(row, "broker")
         ticker_y = _safe_get(row, "ticker_Yahoo") or _safe_get(row, "ticker")
         if ticker_y is None or (isinstance(ticker_y, str) and not str(ticker_y).strip()):
             continue
         key_ticker = str(ticker_y).strip()
-        if broker is None or (isinstance(broker, str) and not str(broker).strip()):
-            if str(_safe_get(row, "type", "") or "").strip().lower() != "split":
+        t = str(_safe_get(row, "type", "") or "").strip().lower()
+
+        if broker_raw is None or (isinstance(broker_raw, str) and not str(broker_raw).strip()):
+            if t != "split":
                 continue
-        broker = str(broker or "").strip()
+        broker = str(broker_raw or "").strip()
 
         qty = _to_float(_safe_get(row, "positionNumber"), 0)
         total_eur = _to_float(_safe_get(row, "totalWithComissionBaseCurrency"), 0)
         price_local = _to_float(_safe_get(row, "price"), 0)
-        t = str(_safe_get(row, "type", "") or "").strip().lower()
 
         if t == "split" and qty > 0:
-            factor = qty
-            idx_split = {k: positions[k]["lots"] for k in positions}
-            for k in _fifo_split_affected_keys_stocks_cartera(idx_split, row, broker, key_ticker, cat_cache):
-                if k in positions:
-                    for lot in positions[k]["lots"]:
-                        lot["qty"] *= factor
+            factor = float(qty)
+            for k in _fifo_split_affected_keys_stocks(queues, row, broker, key_ticker, cat_cache):
+                for lot in queues.get(k, []):
+                    lot["qty"] *= factor
             continue
 
         if t == "spinoff":
-            key_src = _fifo_queue_key_stocks_cartera(row, broker, key_ticker, cat_cache)
-            ensure(key_src, row)
-            lots_src = positions[key_src]["lots"]
+            key_src = _key(row, broker, key_ticker)
+            lots_src = queues.get(key_src, [])
             if not lots_src:
                 continue
             parent_aff_qty = abs(_to_float(_safe_get(row, "positionNumber"), 0.0))
@@ -1959,12 +1947,10 @@ def compute_positions_fifo(df: pd.DataFrame) -> pd.DataFrame:
             child_row["ticker_Yahoo"] = child_ty
             child_row["ticker"] = child_ty
             child_row["isin"] = child_isin
-            key_dst = _fifo_queue_key_stocks_cartera(child_row, broker, child_ty, cat_cache)
-            ensure(key_dst, child_row)
-            positions[key_dst]["Ticker_Yahoo"] = child_ty
-            positions[key_dst]["ticker_orig"] = child_ticker_hint or child_ty
             if child_name_hint:
-                positions[key_dst]["name"] = child_name_hint
+                child_row["name"] = child_name_hint
+            key_dst = _key(child_row, broker, child_ty)
+            queues.setdefault(key_dst, [])
 
             remaining = parent_aff_qty
             for lot in lots_src:
@@ -1980,9 +1966,8 @@ def compute_positions_fifo(df: pd.DataFrame) -> pd.DataFrame:
                 child_cost_local = float(lot["cost_local"]) * frac * alloc
                 lot["cost_eur"] -= child_cost_eur
                 lot["cost_local"] -= child_cost_local
-                positions[key_dst]["lots"].append(
-                    {"qty": child_qty, "cost_eur": child_cost_eur, "cost_local": child_cost_local}
-                )
+                child_lot = _new_lot(child_qty, child_cost_eur, child_cost_local, lot.get("Broker") or broker, child_row)
+                queues[key_dst].append(child_lot)
                 remaining -= take
             continue
 
@@ -2005,48 +1990,85 @@ def compute_positions_fifo(df: pd.DataFrame) -> pd.DataFrame:
             if not dest_raw:
                 continue
             dest_broker = str(dest_raw).strip()
-            src_key = _fifo_queue_key_stocks_cartera(row, broker, key_ticker, cat_cache)
-            ensure(src_key, row)
-            if src_key[0] == "ISIN_BR_CCY":
-                _, isin_k, _, ccy_k = src_key
-                dst_key = ("ISIN_BR_CCY", isin_k, dest_broker, ccy_k)
-            else:
-                dst_key = ("PAIR", dest_broker, src_key[2])
-            ensure(dst_key, row)
-            positions[dst_key]["Broker"] = dest_broker
-            src_lots = positions[src_key]["lots"]
-            remaining = qty
+            src_key = _key(row, broker, key_ticker)
+
+            if src_key[0] == "ISIN":
+                # Cola global única por ISIN: retag de lotes FIFO con Broker == broker origen
+                lots = queues.get(src_key, [])
+                remaining = float(qty)
+                i = 0
+                while remaining > MIN_POSITION and i < len(lots):
+                    lot = lots[i]
+                    lot_b = str(lot.get("Broker") or "").strip()
+                    lot_qty = float(lot.get("qty") or 0.0)
+                    if lot_b != broker or lot_qty <= MIN_POSITION:
+                        i += 1
+                        continue
+                    if lot_qty <= remaining + MIN_POSITION:
+                        lot["Broker"] = dest_broker
+                        remaining -= lot_qty
+                        i += 1
+                    else:
+                        frac = remaining / lot_qty
+                        new_part = dict(lot)
+                        new_part["qty"] = remaining
+                        new_part["cost_eur"] = lot["cost_eur"] * frac
+                        new_part["cost_local"] = lot["cost_local"] * frac
+                        new_part["Broker"] = dest_broker
+                        lot["qty"] = lot_qty - remaining
+                        lot["cost_eur"] -= new_part["cost_eur"]
+                        lot["cost_local"] -= new_part["cost_local"]
+                        lots.insert(i + 1, new_part)
+                        remaining = 0
+                continue
+
+            # Sin ISIN (PAIR): se mueven lotes FIFO a la cola del nuevo broker
+            dst_key = ("PAIR", dest_broker, src_key[2])
+            src_lots = queues.get(src_key, [])
+            queues.setdefault(dst_key, [])
+            dst_lots = queues[dst_key]
+            remaining = float(qty)
             while remaining > MIN_POSITION and src_lots:
                 lot = src_lots[0]
-                lot_qty = lot["qty"]
+                lot_qty = float(lot["qty"])
                 if lot_qty <= remaining + MIN_POSITION:
-                    positions[dst_key]["lots"].append({"qty": lot_qty, "cost_eur": lot["cost_eur"], "cost_local": lot["cost_local"]})
+                    moved = dict(lot)
+                    moved["Broker"] = dest_broker
+                    dst_lots.append(moved)
                     remaining -= lot_qty
                     src_lots.pop(0)
                 else:
                     frac = remaining / lot_qty
-                    positions[dst_key]["lots"].append({
-                        "qty": remaining,
-                        "cost_eur": lot["cost_eur"] * frac,
-                        "cost_local": lot["cost_local"] * frac,
-                    })
+                    moved = dict(lot)
+                    moved["qty"] = remaining
+                    moved["cost_eur"] = lot["cost_eur"] * frac
+                    moved["cost_local"] = lot["cost_local"] * frac
+                    moved["Broker"] = dest_broker
+                    dst_lots.append(moved)
                     lot["qty"] -= remaining
-                    lot["cost_eur"] -= lot["cost_eur"] * frac
-                    lot["cost_local"] -= lot["cost_local"] * frac
+                    lot["cost_eur"] -= moved["cost_eur"]
+                    lot["cost_local"] -= moved["cost_local"]
                     remaining = 0
             continue
 
-        key = _fifo_queue_key_stocks_cartera(row, broker, key_ticker, cat_cache)
+        key = _key(row, broker, key_ticker)
+        queues.setdefault(key, [])
+        lots = queues[key]
 
         if t in ("buy", "switchbuy", "bonus", "stakereward"):
-            ensure(key, row)
-            lots = positions[key]["lots"]
             rem = float(qty)
             cost_eur_tot = _to_float(total_eur)
             rem = rem if rem > MIN_POSITION else 0.0
-            while rem > MIN_POSITION and lots and float(lots[0]["qty"]) < -MIN_POSITION:
-                lot = lots[0]
-                abs_s = abs(float(lot["qty"]))
+            # Si hay short del mismo bróker, cubre primero
+            i = 0
+            while rem > MIN_POSITION and i < len(lots):
+                lot = lots[i]
+                lot_qty = float(lot["qty"])
+                lot_b = str(lot.get("Broker") or "").strip()
+                if lot_qty >= -MIN_POSITION or lot_b != broker:
+                    i += 1
+                    continue
+                abs_s = abs(lot_qty)
                 take = min(rem, abs_s)
                 frac = take / abs_s if abs_s > 1e-12 else 1.0
                 lot["cost_eur"] *= 1.0 - frac
@@ -2054,20 +2076,26 @@ def compute_positions_fifo(df: pd.DataFrame) -> pd.DataFrame:
                 lot["qty"] += take
                 rem -= take
                 if abs(float(lot["qty"])) < MIN_POSITION:
-                    lots.pop(0)
+                    lots.pop(i)
+                else:
+                    i += 1
             if rem > MIN_POSITION:
                 cost_eur = cost_eur_tot * (rem / qty) if qty > 1e-12 else cost_eur_tot
                 cost_local = (price_local * rem) if price_local else 0.0
-                lots.append({"qty": rem, "cost_eur": cost_eur, "cost_local": cost_local})
+                lots.append(_new_lot(rem, cost_eur, cost_local, broker, row))
             continue
 
         if t == "optionbuy":
-            ensure(key, row)
-            lots = positions[key]["lots"]
-            rem = qty
-            while rem > MIN_POSITION and lots and lots[0]["qty"] < -MIN_POSITION:
-                lot = lots[0]
-                abs_s = abs(float(lot["qty"]))
+            rem = float(qty)
+            i = 0
+            while rem > MIN_POSITION and i < len(lots):
+                lot = lots[i]
+                lot_qty = float(lot["qty"])
+                lot_b = str(lot.get("Broker") or "").strip()
+                if lot_qty >= -MIN_POSITION or lot_b != broker:
+                    i += 1
+                    continue
+                abs_s = abs(lot_qty)
                 take = min(rem, abs_s)
                 frac = take / abs_s if abs_s > 1e-12 else 1.0
                 lot["cost_eur"] *= 1.0 - frac
@@ -2075,30 +2103,39 @@ def compute_positions_fifo(df: pd.DataFrame) -> pd.DataFrame:
                 lot["qty"] += take
                 rem -= take
                 if abs(float(lot["qty"])) < MIN_POSITION:
-                    lots.pop(0)
+                    lots.pop(i)
+                else:
+                    i += 1
             if rem > MIN_POSITION:
                 cost_eur = _to_float(total_eur) * (rem / qty) if qty > 1e-12 else _to_float(total_eur)
                 cost_local = (price_local * rem) if price_local else 0.0
-                positions[key]["lots"].append({"qty": rem, "cost_eur": cost_eur, "cost_local": cost_local})
+                lots.append(_new_lot(rem, cost_eur, cost_local, broker, row))
             continue
 
         if t in ("sell", "switch"):
-            ensure(key, row)
-            lots = positions[key]["lots"]
-            remaining = abs(qty)
+            remaining = abs(float(qty))
             sell_total = remaining if remaining > 1e-12 else 1.0
             total_eur_f = _to_float(total_eur)
             price_local_f = _to_float(price_local)
+            # FIFO global: consume desde la cabeza, sin importar el bróker actual del lote
             while remaining > MIN_POSITION and lots:
                 lot = lots[0]
                 lot_qty = float(lot["qty"])
                 if lot_qty < -MIN_POSITION:
-                    te_part = total_eur_f * (remaining / sell_total) if sell_total > 1e-12 else total_eur_f
-                    lot["qty"] -= remaining
-                    lot["cost_eur"] -= te_part
-                    lot["cost_local"] -= price_local_f * remaining
-                    remaining = 0
-                    break
+                    # Short pendiente: cierre si hay quien lo cubra del mismo bróker
+                    lot_b = str(lot.get("Broker") or "").strip()
+                    if lot_b == broker:
+                        te_part = total_eur_f * (remaining / sell_total) if sell_total > 1e-12 else total_eur_f
+                        lot["qty"] -= remaining
+                        lot["cost_eur"] -= te_part
+                        lot["cost_local"] -= price_local_f * remaining
+                        remaining = 0
+                        break
+                    # Short de otro bróker: ignorar, no se mezcla
+                    # Movemos esos shorts al final para no bloquear ventas reales
+                    short_lot = lots.pop(0)
+                    lots.append(short_lot)
+                    continue
                 if lot_qty < MIN_POSITION:
                     lots.pop(0)
                     continue
@@ -2113,17 +2150,13 @@ def compute_positions_fifo(df: pd.DataFrame) -> pd.DataFrame:
                     remaining = 0
             if remaining > MIN_POSITION:
                 fr = remaining / sell_total if sell_total > 1e-12 else 1.0
-                lots.append({
-                    "qty": -remaining,
-                    "cost_eur": -total_eur_f * fr,
-                    "cost_local": -price_local_f * remaining,
-                })
+                lots.append(
+                    _new_lot(-remaining, -total_eur_f * fr, -price_local_f * remaining, broker, row)
+                )
             continue
 
         if t == "optionsell":
-            ensure(key, row)
-            lots = positions[key]["lots"]
-            rem = abs(qty)
+            rem = abs(float(qty))
             total_long = sum(max(0.0, float(l["qty"])) for l in lots)
             if total_long > MIN_POSITION:
                 remaining = rem
@@ -2145,30 +2178,65 @@ def compute_positions_fifo(df: pd.DataFrame) -> pd.DataFrame:
             else:
                 te = _to_float(total_eur)
                 pl = _to_float(price_local)
-                lots.append({"qty": -rem, "cost_eur": -te, "cost_local": -pl * rem})
+                lots.append(_new_lot(-rem, -te, -pl * rem, broker, row))
             continue
 
+    # Display: una fila por (Broker, Ticker_Yahoo, Divisa) agregando lotes
+    grouped: dict[tuple, dict] = {}
+    for key, lots in queues.items():
+        for lot in lots:
+            qv = float(lot.get("qty") or 0.0)
+            if abs(qv) < MIN_POSITION:
+                continue
+            br = str(lot.get("Broker") or "").strip()
+            ty = str(lot.get("Ticker_Yahoo") or "").strip()
+            ccy = str(lot.get("pos_currency") or "EUR").strip().upper() or "EUR"
+            gkey = (br, ty, ccy)
+            agg = grouped.get(gkey)
+            if agg is None:
+                agg = {
+                    "Broker": br,
+                    "Ticker": lot.get("ticker_orig") or ty,
+                    "Ticker_Yahoo": ty,
+                    "Nombre": lot.get("name") or ty,
+                    "Titulos": 0.0,
+                    "Cost_EUR": 0.0,
+                    "Cost_Local": 0.0,
+                    "Moneda Activo": ccy,
+                    "Tipo activo": lot.get("pos_type") or "",
+                }
+                grouped[gkey] = agg
+            else:
+                if lot.get("ticker_orig"):
+                    agg["Ticker"] = lot["ticker_orig"]
+                if lot.get("name"):
+                    agg["Nombre"] = lot["name"]
+                if lot.get("pos_type"):
+                    agg["Tipo activo"] = lot["pos_type"]
+            agg["Titulos"] += qv
+            agg["Cost_EUR"] += float(lot.get("cost_eur") or 0.0)
+            agg["Cost_Local"] += float(lot.get("cost_local") or 0.0)
+
     rows = []
-    for _fifo_key, p in positions.items():
-        total_qty = sum(l["qty"] for l in p["lots"])
-        total_cost_eur = sum(l["cost_eur"] for l in p["lots"])
-        total_cost_local = sum(l["cost_local"] for l in p["lots"])
+    for agg in grouped.values():
+        total_qty = float(agg["Titulos"])
         if abs(total_qty) < MIN_POSITION:
             continue
+        total_cost_eur = float(agg["Cost_EUR"])
+        total_cost_local = float(agg["Cost_Local"])
         avg_eur = total_cost_eur / total_qty if total_qty else math.nan
         avg_local = total_cost_local / total_qty if total_qty else math.nan
-        ty_disp = p.get("Ticker_Yahoo") or ""
         rows.append({
-            "Broker": p.get("Broker") or "",
-            "Ticker": p.get("ticker_orig") or ty_disp,
-            "Ticker_Yahoo": ty_disp,
-            "Nombre": p["name"],
+            "Broker": agg["Broker"],
+            "Ticker": agg["Ticker"],
+            "Ticker_Yahoo": agg["Ticker_Yahoo"],
+            "Nombre": agg["Nombre"],
             "Titulos": total_qty,
             "Precio Medio Moneda": avg_local,
             "Precio Medio €": avg_eur,
             "Inversion €": total_cost_eur,
-            "Moneda Activo": p["pos_currency"] or "EUR",
-            "Tipo activo": p.get("pos_type") or "",
+            "Moneda Activo": agg["Moneda Activo"],
+            "Tipo activo": agg["Tipo activo"],
         })
 
     if not rows:
