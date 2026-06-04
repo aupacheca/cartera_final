@@ -4453,13 +4453,32 @@ def _fifo_first_nonempty(series: pd.Series) -> str:
     return ""
 
 
+_FIFO_LOTE_KEYS = ["Origen FIFO", "_yahoo", "_fecha", "_pm"]
+
+
+def _fifo_brokers_agg(series: pd.Series) -> str:
+    """Etiqueta de broker(es) para un lote fiscal (FIFO global por ISIN)."""
+    brs = sorted(
+        {
+            str(x).strip()
+            for x in series
+            if str(x).strip() and str(x).strip() not in ("—", "nan", "None")
+        }
+    )
+    if not brs:
+        return ""
+    if len(brs) == 1:
+        return brs[0]
+    return ", ".join(brs)
+
+
 _fifo_cons_cols = [
     "Origen FIFO",
-    "Broker",
     "_yahoo",
     "_fecha",
     "_pm",
     "consumida",
+    "Broker",
     "Nombre_ref",
     "Ticker_ref",
 ]
@@ -4487,9 +4506,10 @@ def _fifo_consume_groups_from_detail(sd: pd.DataFrame | None) -> tuple[pd.DataFr
     if not sdc[~mask_c].empty:
         cons_non = (
             sdc[~mask_c]
-            .groupby(["Origen FIFO", "Broker", "_yahoo", "_fecha", "_pm"], as_index=False, dropna=False)
+            .groupby(_FIFO_LOTE_KEYS, as_index=False, dropna=False)
             .agg(
                 consumida=("Cantidad (tramo)", "sum"),
+                Broker=("Broker", _fifo_brokers_agg),
                 Nombre_ref=("Nombre", _fifo_first_nonempty),
                 Ticker_ref=("Ticker", _fifo_first_nonempty),
             )
@@ -4561,6 +4581,7 @@ def build_fifo_lote_estado_ledger(
 ) -> pd.DataFrame:
     """
     Reconstruye cada lote FIFO: cantidad inicial ≈ restante + consumida, y Estado Vivo / Parcial / Agotado.
+    Acciones/ETFs/fondos: una fila por lote (fecha + precio medio), sin duplicar por broker de la venta.
     Cripto usa FIFO global por ticker: Broker «—» en esta vista.
     Si sales_detail_ejercicio no es None, se añade «Consumida (ejercicio)» (solo tramos con Fecha venta en ese año);
     «Consumida», Estado y % consumido siguen usando el histórico en sales_detail_df.
@@ -4570,7 +4591,7 @@ def build_fifo_lote_estado_ledger(
     has_y = sales_detail_ejercicio is not None and not sales_detail_ejercicio.empty
     has_lots = lots_df is not None and not lots_df.empty
     ejercicio_cols = sales_detail_ejercicio is not None
-    keys_merge = ["Origen FIFO", "Broker", "_yahoo", "_fecha", "_pm"]
+    keys_merge = list(_FIFO_LOTE_KEYS)
     if not has_lots and not has_full and not has_y:
         return pd.DataFrame()
 
@@ -4595,18 +4616,17 @@ def build_fifo_lote_estado_ledger(
         tipo_ser = ld.get("Tipo activo", pd.Series([""] * len(ld))).astype(str).str.lower()
         ld["_is_c"] = tipo_ser == "crypto"
         if not ld[~ld["_is_c"]].empty:
+            ld_acc = ld[~ld["_is_c"]].copy()
+            ld_acc["Origen FIFO"] = ld_acc["Tipo activo"].map(_fifo_tipo_to_origen_fifo)
             live_non = (
-                ld[~ld["_is_c"]]
-                .groupby(["Broker", "_yahoo", "_fecha", "_pm"], as_index=False, dropna=False)
+                ld_acc.groupby(_FIFO_LOTE_KEYS, as_index=False, dropna=False)
                 .agg(
                     restante=("Cantidad", "sum"),
+                    Broker=("Broker", _fifo_brokers_agg),
                     Ticker=("Ticker", "first"),
                     Nombre=("Nombre", "first"),
-                    Tipo_act=("Tipo activo", "first"),
                 )
             )
-            live_non["Origen FIFO"] = live_non["Tipo_act"].map(_fifo_tipo_to_origen_fifo)
-            live_non = live_non.drop(columns=["Tipo_act"], errors="ignore")
         if not ld[ld["_is_c"]].empty:
             live_c = (
                 ld[ld["_is_c"]]
@@ -4644,18 +4664,17 @@ def build_fifo_lote_estado_ledger(
         cons_non = pd.DataFrame(columns=cols_cons)
         cons_c = pd.DataFrame(columns=cols_cons)
 
-    m_non = pd.merge(
-        live_non,
-        cons_non,
-        on=["Origen FIFO", "Broker", "_yahoo", "_fecha", "_pm"],
-        how="outer",
-    )
-    m_c = pd.merge(
-        live_c,
-        cons_c,
-        on=["Origen FIFO", "Broker", "_yahoo", "_fecha", "_pm"],
-        how="outer",
-    )
+    m_non = pd.merge(live_non, cons_non, on=keys_merge, how="outer", suffixes=("", "_cons"))
+    if "Broker_cons" in m_non.columns:
+        m_non["Broker"] = m_non["Broker"].fillna(m_non["Broker_cons"])
+        m_non = m_non.drop(columns=["Broker_cons"], errors="ignore")
+    m_non["Broker"] = m_non["Broker"].fillna("").astype(str)
+
+    m_c = pd.merge(live_c, cons_c, on=keys_merge, how="outer", suffixes=("", "_cons"))
+    if "Broker_cons" in m_c.columns:
+        m_c["Broker"] = m_c["Broker"].fillna(m_c["Broker_cons"])
+        m_c = m_c.drop(columns=["Broker_cons"], errors="ignore")
+    m_c["Broker"] = m_c["Broker"].fillna("—").astype(str)
     ledger = pd.concat([m_non, m_c], ignore_index=True)
     ledger["restante"] = pd.to_numeric(ledger["restante"], errors="coerce").fillna(0.0)
     ledger["consumida"] = pd.to_numeric(ledger["consumida"], errors="coerce").fillna(0.0)
@@ -4735,10 +4754,7 @@ def build_fifo_lote_estado_ledger(
     ):
         dn_fv = _fifo_sales_detail_norm_keys(sales_detail_ejercicio)
         fv_by_lote = (
-            dn_fv.groupby(
-                ["Origen FIFO", "Broker", "_yahoo", "_fecha", "_pm"],
-                dropna=False,
-            )["Fecha venta"]
+            dn_fv.groupby(_FIFO_LOTE_KEYS, dropna=False)["Fecha venta"]
             .apply(
                 lambda s: ", ".join(
                     sorted(
@@ -4764,7 +4780,7 @@ def build_fifo_lote_estado_ledger(
         ).round(8)
         out = out.merge(
             fv_by_lote,
-            on=["Origen FIFO", "Broker", "Yahoo/Ticker", "Fecha lote", "Precio medio €"],
+            on=["Origen FIFO", "Yahoo/Ticker", "Fecha lote", "Precio medio €"],
             how="left",
         )
         out["Fechas venta (ej.)"] = out["_fechas_v_ej"].fillna("").astype(str)
