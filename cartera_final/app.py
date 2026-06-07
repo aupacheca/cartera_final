@@ -4442,6 +4442,69 @@ def _fifo_tipo_to_origen_fifo(tipo: str) -> str:
     return "Acciones/ETFs"
 
 
+def _fifo_tipo_label(tipo: str) -> str:
+    t = str(tipo or "").strip().lower()
+    if t == "stock":
+        return "Valores"
+    if t == "etf":
+        return "ETFs"
+    if t == "fund":
+        return "Fondos"
+    if t == "crypto":
+        return "Cripto"
+    if t == "warrant":
+        return "Otros"
+    if t == "putoption":
+        return "Puts"
+    if t == "calloption":
+        return "Calls"
+    return "Valores" if t else "Otros"
+
+
+_FIFO_TIPO_FILTER_ORDER = ["Valores", "ETFs", "Fondos", "Cripto", "Puts", "Calls", "Otros"]
+
+
+def _fifo_tipo_activo_options(det: pd.DataFrame) -> list[str]:
+    opts = ["(Todos)"]
+    if det is None or det.empty or "Tipo activo" not in det.columns:
+        return opts
+    seen = {
+        _fifo_tipo_label(t)
+        for t in det["Tipo activo"].astype(str).str.strip().str.lower().unique()
+    }
+    return opts + [lbl for lbl in _FIFO_TIPO_FILTER_ORDER if lbl in seen]
+
+
+def _fifo_mask_tipo_sel(tipo_series: pd.Series, sel_tipo: str) -> pd.Series:
+    if sel_tipo == "(Todos)":
+        return pd.Series(True, index=tipo_series.index)
+    tipos = tipo_series.astype(str).str.strip().str.lower()
+    if sel_tipo == "Valores":
+        return (tipos == "stock") | (
+            (tipos != "etf")
+            & (tipos != "fund")
+            & (tipos != "crypto")
+            & (tipos != "warrant")
+            & (tipos != "putoption")
+            & (tipos != "calloption")
+            & (tipos != "")
+            & (tipos != "nan")
+        )
+    if sel_tipo == "ETFs":
+        return tipos == "etf"
+    if sel_tipo == "Fondos":
+        return tipos == "fund"
+    if sel_tipo == "Cripto":
+        return tipos == "crypto"
+    if sel_tipo == "Otros":
+        return tipos == "warrant"
+    if sel_tipo == "Puts":
+        return tipos == "putoption"
+    if sel_tipo == "Calls":
+        return tipos == "calloption"
+    return pd.Series(False, index=tipo_series.index)
+
+
 def _fifo_first_nonempty(series: pd.Series) -> str:
     """Primer valor no vacío en la columna (p. ej. nombre/ticker repetidos en tramos de una misma venta)."""
     for x in series:
@@ -4572,6 +4635,174 @@ def _fifo_mismo_anio_label(fecha_lote, fechas_venta_ej: object) -> str:
     if years_v == {y_lote}:
         return "✓"
     return ""
+
+
+def _fifo_prepare_tramos_df(sales_detail_ejercicio: pd.DataFrame) -> pd.DataFrame:
+    """Enriquece el detalle FIFO del ejercicio con fechas, año adq. y flag Corrección."""
+    det = sales_detail_ejercicio.copy()
+    det["_fd_adq"] = pd.to_datetime(det.get("Fecha origen (lote)"), errors="coerce")
+    det["_fd_vta"] = pd.to_datetime(det.get("Fecha venta"), errors="coerce")
+    det["_ano_adq"] = det["_fd_adq"].dt.year
+    det["_ano_vta"] = det["_fd_vta"].dt.year
+    det["Año adq."] = det["_ano_adq"].apply(lambda y: str(int(y)) if pd.notna(y) else "")
+    det["Corrección"] = np.where(
+        det["_ano_adq"].notna()
+        & det["_ano_vta"].notna()
+        & (det["_ano_adq"] < det["_ano_vta"]),
+        "Sí",
+        "No",
+    )
+    return det
+
+
+def _fifo_filter_tramos_df(
+    det: pd.DataFrame,
+    *,
+    q_ticker: str,
+    q_nombre: str,
+    sel_br: str,
+    sel_orig: str,
+    sel_ant: str,
+    sel_fv: str,
+    sel_tipo: str,
+) -> pd.DataFrame:
+    out = det.copy()
+    if (q_ticker or "").strip():
+        qt = (q_ticker or "").strip().lower()
+        t_col = out["Ticker"].astype(str).str.lower()
+        y_col = out.get("Ticker_Yahoo", pd.Series([""] * len(out))).astype(str).str.lower()
+        out = out[t_col.str.contains(qt, regex=False, na=False) | y_col.str.contains(qt, regex=False, na=False)]
+    if (q_nombre or "").strip() and "Nombre" in out.columns:
+        qn = (q_nombre or "").strip().lower()
+        out = out[out["Nombre"].astype(str).str.lower().str.contains(qn, regex=False, na=False)]
+    if sel_br != "(Todos)":
+        out = out[out["Broker"].astype(str) == sel_br]
+    if sel_orig != "(Todos)":
+        out = out[out["Origen FIFO"].astype(str) == sel_orig]
+    if sel_ant == "Mismo año que la venta":
+        out = out[out["Corrección"] == "No"]
+    elif sel_ant == "Año anterior (requiere corrección)":
+        out = out[out["Corrección"] == "Sí"]
+    elif sel_ant != "(Todos)":
+        try:
+            out = out[out["_ano_adq"] == int(sel_ant)]
+        except ValueError:
+            pass
+    if sel_fv != "(Todas)":
+        out = out[out["_fd_vta"].dt.strftime("%Y-%m-%d") == sel_fv]
+    if sel_tipo != "(Todos)" and "Tipo activo" in out.columns:
+        out = out[_fifo_mask_tipo_sel(out["Tipo activo"], sel_tipo)]
+    return out
+
+
+def _fifo_lote_keys_from_tramos(det: pd.DataFrame) -> set[tuple]:
+    """Claves de lote (origen, yahoo, fecha, precio medio) para cruzar tramos ↔ ledger."""
+    keys: set[tuple] = set()
+    if det is None or det.empty:
+        return keys
+    for _, r in det.iterrows():
+        yahoo = str(r.get("Ticker_Yahoo") or r.get("Ticker") or "").strip()
+        fecha = _fifo_norm_fecha_hist(r.get("Fecha origen (lote)"))
+        qty = pd.to_numeric(r.get("Cantidad (tramo)"), errors="coerce")
+        val = pd.to_numeric(r.get("Valor compra histórico (€)"), errors="coerce")
+        pm = round(float(val / qty), 8) if pd.notna(qty) and float(qty) > 1e-12 and pd.notna(val) else 0.0
+        keys.add((str(r.get("Origen FIFO") or "").strip(), yahoo, fecha, pm))
+    return keys
+
+
+def _fifo_filter_ledger_df(
+    ledger: pd.DataFrame,
+    *,
+    q_ticker: str,
+    q_nombre: str,
+    sel_br: str,
+    sel_orig: str,
+    sel_ant: str,
+    sel_fv: str,
+    sel_est: str,
+    solo_consumo_ej: bool,
+    tramo_keys: set[tuple] | None = None,
+) -> pd.DataFrame:
+    lv = ledger.copy()
+    if solo_consumo_ej and "Consumida (ejercicio)" in lv.columns:
+        _eps_c = max(MIN_POSITION * 100, 1e-6)
+        lv = lv[pd.to_numeric(lv["Consumida (ejercicio)"], errors="coerce").fillna(0.0) > _eps_c]
+    if (q_ticker or "").strip():
+        qt = (q_ticker or "").strip().lower()
+        t_col = lv["Ticker"].astype(str).str.lower()
+        y_col = lv["Yahoo/Ticker"].astype(str).str.lower()
+        lv = lv[t_col.str.contains(qt, regex=False, na=False) | y_col.str.contains(qt, regex=False, na=False)]
+    if (q_nombre or "").strip() and "Nombre" in lv.columns:
+        qn = (q_nombre or "").strip().lower()
+        lv = lv[lv["Nombre"].astype(str).str.lower().str.contains(qn, regex=False, na=False)]
+    if sel_br != "(Todos)":
+        lv = lv[lv["Broker"].astype(str) == sel_br]
+    if sel_orig != "(Todos)":
+        lv = lv[lv["Origen FIFO"].astype(str) == sel_orig]
+    if sel_est != "(Todos)":
+        lv = lv[lv["Estado"].astype(str) == sel_est]
+    if sel_ant == "Mismo año que la venta":
+        lv = lv[lv.get("Mismo año", pd.Series([""] * len(lv))).astype(str).str.strip() == "✓"]
+    elif sel_ant == "Año anterior (requiere corrección)":
+        lv = lv[lv.get("Mismo año", pd.Series([""] * len(lv))).astype(str).str.strip() != "✓"]
+    elif sel_ant != "(Todos)":
+        try:
+            y_f = int(sel_ant)
+            lv = lv[pd.to_datetime(lv["Fecha lote"], errors="coerce").dt.year == y_f]
+        except ValueError:
+            pass
+    if sel_fv != "(Todas)" and "Fechas venta (ej.)" in lv.columns:
+        lv = lv[lv["Fechas venta (ej.)"].astype(str).str.contains(sel_fv, regex=False, na=False)]
+    if tramo_keys:
+        def _row_key(r) -> tuple:
+            pm = round(float(pd.to_numeric(r.get("Precio medio €"), errors="coerce") or 0.0), 8)
+            return (
+                str(r.get("Origen FIFO") or "").strip(),
+                str(r.get("Yahoo/Ticker") or r.get("Ticker") or "").strip(),
+                _fifo_norm_fecha_hist(r.get("Fecha lote")),
+                pm,
+            )
+        lv = lv[lv.apply(lambda r: _row_key(r) in tramo_keys, axis=1)]
+    return lv
+
+
+def _fifo_sort_tramos(det: pd.DataFrame, sel_sort: str) -> pd.DataFrame:
+    if det.empty:
+        return det
+    if sel_sort == "Fecha venta → Fecha lote":
+        return det.sort_values(["_fd_vta", "Broker", "Ticker", "_fd_adq"], ascending=[True, True, True, True])
+    if sel_sort == "Fecha lote (cronológico)":
+        return det.sort_values(["_fd_adq", "_fd_vta", "Ticker"], ascending=[True, True, True])
+    if sel_sort == "Ticker A-Z":
+        return det.sort_values(["Ticker", "_fd_vta", "_fd_adq"], ascending=[True, True, True])
+    if sel_sort == "Año adq. (antiguo primero)":
+        return det.sort_values(["_ano_adq", "_fd_vta", "Ticker", "_fd_adq"], ascending=[True, True, True, True])
+    det = det.copy()
+    det["_corr_ord"] = det["Corrección"].map({"Sí": 0, "No": 1}).fillna(2)
+    return det.sort_values(
+        ["_corr_ord", "_fd_vta", "Ticker", "_fd_adq"], ascending=[True, True, True, True]
+    ).drop(columns=["_corr_ord"], errors="ignore")
+
+
+def _fifo_sort_ledger(lv: pd.DataFrame, sel_sort: str) -> pd.DataFrame:
+    if lv.empty:
+        return lv
+    lv = lv.copy()
+    if sel_sort == "Fecha lote (cronológico)":
+        lv["_fd"] = pd.to_datetime(lv["Fecha lote"], errors="coerce")
+        return lv.sort_values(["_fd", "Ticker"], ascending=[True, True]).drop(columns=["_fd"])
+    if sel_sort == "Fecha lote (reciente primero)":
+        lv["_fd"] = pd.to_datetime(lv["Fecha lote"], errors="coerce")
+        return lv.sort_values(["_fd", "Ticker"], ascending=[False, True]).drop(columns=["_fd"])
+    if sel_sort == "Ticker A-Z":
+        return lv.sort_values(["Ticker", "Fecha lote"], ascending=[True, True])
+    if sel_sort == "Estado: Vivo → Parcial → Agotado":
+        _ord_map = {"Vivo": 0, "Parcial": 1, "Agotado": 2}
+        lv["_so"] = lv["Estado"].map(lambda x: _ord_map.get(str(x).strip(), 9))
+        return lv.sort_values(["_so", "Fecha lote", "Ticker"], ascending=[True, True, True]).drop(columns=["_so"])
+    if sel_sort == "% consumido (mayor a menor)":
+        return lv.sort_values(["% consumido", "Fecha lote"], ascending=[False, True])
+    return lv.sort_values(["% consumido", "Fecha lote"], ascending=[True, True])
 
 
 def build_fifo_lote_estado_ledger(
@@ -8929,26 +9160,13 @@ def main() -> None:
                 )
 
         # --- Tabs ---
-        tab_resumen, tab_gp_tipo, tab_gp_activo, tab_div_pos, tab_fifo_tramos, tab_regla_2m = st.tabs([
+        tab_resumen, tab_gp_tipo, tab_gp_activo, tab_fifo_ventas, tab_regla_2m = st.tabs([
             "G/P por tipo de posición",
             "G/P por activo",
             "Dividendos por posición",
-            "Posiciones vivas / Ventas (detalle)",
-            "Detalle FIFO (tramos)",
+            "FIFO y ventas",
             "Regla 2 meses (ISIN)",
         ])
-
-        # Mapeo tipo activo → etiqueta
-        def _tipo_label(t):
-            t = str(t or "").strip().lower()
-            if t == "stock": return "Valores"
-            if t == "etf": return "ETFs"
-            if t == "fund": return "Fondos"
-            if t == "crypto": return "Cripto"
-            if t == "warrant": return "Otros"
-            if t == "putoption": return "Puts"
-            if t == "calloption": return "Calls"
-            return "Valores" if t else "Otros"
 
         with tab_resumen:
             st.subheader("G/P realizadas por tipo de posición")
@@ -8956,7 +9174,7 @@ def main() -> None:
                 st.info("No hay ventas en este ejercicio.")
             else:
                 sales_tipo = sales_ejercicio.copy()
-                sales_tipo["Tipo"] = sales_tipo["Tipo activo"].apply(_tipo_label)
+                sales_tipo["Tipo"] = sales_tipo["Tipo activo"].apply(_fifo_tipo_label)
                 agg_dict = {
                     "total_recibido": ("Valor venta (€)", "sum"),
                     "coste_total": ("Valor compra histórico (€)", "sum"),
@@ -8992,7 +9210,7 @@ def main() -> None:
                 if "Retención dest. (€)" in sales_ejercicio.columns:
                     cols_activo.append("Retención dest. (€)")
                 sales_activo = sales_ejercicio.copy()
-                sales_activo["Tipo"] = sales_activo["Tipo activo"].apply(_tipo_label)
+                sales_activo["Tipo"] = sales_activo["Tipo activo"].apply(_fifo_tipo_label)
                 agg_act_dict = {
                     "valor_adq": ("Valor compra histórico (€)", "sum"),
                     "valor_trans": ("Valor venta (€)", "sum"),
@@ -9123,277 +9341,395 @@ def main() -> None:
                     use_container_width=True,
                 )
 
-        with tab_div_pos:
-            st.subheader("Estado de lotes FIFO (consumo acumulado)")
+
+        with tab_fifo_ventas:
+            st.subheader("FIFO y ventas")
             st.caption(
-                "**Vivo** (fila en blanco): el lote no ha sido vendido/permutado. "
-                "**Parcial** (fondo ámbar): parte de la cantidad ya se consumió en ventas o permutas. "
-                "**Agotado** (fondo gris): todo consumido; solo aparece en histórico. "
-                "Cripto usa FIFO global por ticker (**Broker** «—»). "
-                "**Consumida** y **% consumido** son históricos (todos los tramos). "
-                f"**Consumida (ejercicio)** = tramos con fecha de venta en **{ejercicio}**. "
-                "**Mismo año**: columna estrecha con **✓** si la fecha de lote y la(s) venta(s) del ejercicio son del **mismo año natural** (compra y venta en ese año); vacío si la compra fue en un año anterior u otra mezcla de años."
+                f"Vista unificada para la Renta **{ejercicio}**: **tramos** (detalle por lote consumido, Zergabidea), "
+                "**estado de lotes** (Vivo/Parcial/Agotado) y, al final, **ventas** y **posiciones vivas**. "
+                "Los filtros superiores aplican a tramos y lotes."
+            )
+
+            det_base = (
+                _fifo_prepare_tramos_df(sales_detail_ejercicio)
+                if sales_detail_ejercicio is not None and not sales_detail_ejercicio.empty
+                else pd.DataFrame()
             )
             ledger_fifo = build_fifo_lote_estado_ledger(lots_df, sales_detail_df, sales_detail_ejercicio)
-            if ledger_fifo.empty:
-                st.info("No hay datos de lotes ni tramos de venta para mostrar.")
-            else:
-                n_tot = len(ledger_fifo)
-                fc1, fc2, fc3, fc4, fc5 = st.columns(5)
-                with fc1:
-                    q_ticker = st.text_input(
-                        "Ticker / Yahoo",
-                        key="fifo_led_q_ticker",
-                        placeholder="Contiene… (vacío = todos)",
-                        help="Filtra filas donde «Ticker» o «Yahoo/Ticker» contengan el texto (ignora mayúsculas).",
-                    )
-                with fc2:
-                    q_nombre = st.text_input(
-                        "Nombre",
-                        key="fifo_led_q_nombre",
-                        placeholder="Contiene… (vacío = todos)",
-                        help="Filtra por la columna «Nombre» del lote (ignora mayúsculas).",
-                    )
-                with fc3:
-                    br_opts = ["(Todos)"] + sorted(
-                        {str(x).strip() for x in ledger_fifo["Broker"].dropna().unique() if str(x).strip()}
-                    )
-                    sel_br = st.selectbox("Broker", br_opts, key="fifo_led_broker")
-                with fc4:
-                    orig_opts = ["(Todos)"] + sorted(
-                        {str(x).strip() for x in ledger_fifo["Origen FIFO"].dropna().unique() if str(x).strip()}
-                    )
-                    sel_orig = st.selectbox("Origen FIFO", orig_opts, key="fifo_led_origen")
-                with fc5:
-                    est_opts = ["(Todos)", "Vivo", "Parcial", "Agotado"]
-                    sel_est = st.selectbox("Estado", est_opts, key="fifo_led_estado")
-                sort_opts = [
-                    "Fecha lote (cronológico)",
-                    "Fecha lote (reciente primero)",
-                    "Ticker A-Z",
-                    "Estado: Vivo → Parcial → Agotado",
-                    "% consumido (mayor a menor)",
-                    "% consumido (menor a mayor)",
-                ]
-                sel_sort = st.selectbox("Ordenar por", sort_opts, key="fifo_led_sort")
-                solo_consumo_ej = st.checkbox(
-                    f"Recortar: solo tramos vendidos en {ejercicio}",
-                    value=True,
-                    key="fifo_led_solo_ej",
-                    help="Mantiene filas donde «Consumida (ejercicio)» > 0 (hubo al menos una venta con Fecha venta en ese año). "
-                    "Un lote en estado **Parcial** con consumo solo en **otros años** tiene aquí 0 en esa columna y **no se muestra**; "
-                    "desmarca para ver también esos parciales.",
+
+            br_set = set()
+            orig_set = set()
+            if not det_base.empty:
+                br_set |= {str(x).strip() for x in det_base["Broker"].dropna().unique() if str(x).strip()}
+                orig_set |= {str(x).strip() for x in det_base["Origen FIFO"].dropna().unique() if str(x).strip()}
+            if not ledger_fifo.empty:
+                br_set |= {str(x).strip() for x in ledger_fifo["Broker"].dropna().unique() if str(x).strip()}
+                orig_set |= {str(x).strip() for x in ledger_fifo["Origen FIFO"].dropna().unique() if str(x).strip()}
+            br_opts = ["(Todos)"] + sorted(br_set)
+            orig_opts = ["(Todos)"] + sorted(orig_set)
+            anos_adq_set: set[int] = set()
+            if not det_base.empty and "_ano_adq" in det_base.columns:
+                anos_adq_set |= {int(y) for y in det_base["_ano_adq"].dropna().unique()}
+            if not ledger_fifo.empty and "Fecha lote" in ledger_fifo.columns:
+                for y in pd.to_datetime(ledger_fifo["Fecha lote"], errors="coerce").dropna().dt.year.unique():
+                    if pd.notna(y):
+                        anos_adq_set.add(int(y))
+            anos_adq = sorted(anos_adq_set)
+            ant_opts = [
+                "(Todos)",
+                "Mismo año que la venta",
+                "Año anterior (requiere corrección)",
+            ] + [str(y) for y in anos_adq]
+            fechas_vta = sorted(
+                {
+                    pd.Timestamp(x).strftime("%Y-%m-%d")
+                    for x in det_base["_fd_vta"].dropna().unique()
+                }
+            ) if not det_base.empty and "_fd_vta" in det_base.columns else []
+            tipo_opts = _fifo_tipo_activo_options(det_base)
+
+            st.markdown("#### Filtros")
+            ff1, ff2, ff3, ff4, ff5 = st.columns(5)
+            with ff1:
+                q_ticker_u = st.text_input(
+                    "Ticker / Yahoo",
+                    key="fifo_un_q_ticker",
+                    placeholder="Contiene… (vacío = todos)",
+                )
+            with ff2:
+                q_nombre_u = st.text_input(
+                    "Nombre",
+                    key="fifo_un_q_nombre",
+                    placeholder="Contiene… (vacío = todos)",
+                )
+            with ff3:
+                sel_br_u = st.selectbox("Broker", br_opts, key="fifo_un_broker")
+            with ff4:
+                sel_orig_u = st.selectbox("Origen FIFO", orig_opts, key="fifo_un_origen")
+            with ff5:
+                sel_ant_u = st.selectbox(
+                    "Año adquisición",
+                    ant_opts,
+                    key="fifo_un_ano_adq",
+                    help="«Año anterior» = compra en año natural anterior a la venta (corrección en Zergabidea).",
                 )
 
-                lv = ledger_fifo.copy()
-                if solo_consumo_ej and "Consumida (ejercicio)" in lv.columns:
-                    _eps_c = max(MIN_POSITION * 100, 1e-6)
-                    lv = lv[pd.to_numeric(lv["Consumida (ejercicio)"], errors="coerce").fillna(0.0) > _eps_c]
-                if (q_ticker or "").strip():
-                    qt = (q_ticker or "").strip().lower()
-                    t_col = lv["Ticker"].astype(str).str.lower()
-                    y_col = lv["Yahoo/Ticker"].astype(str).str.lower()
-                    lv = lv[t_col.str.contains(qt, regex=False, na=False) | y_col.str.contains(qt, regex=False, na=False)]
-                if (q_nombre or "").strip() and "Nombre" in lv.columns:
-                    qn = (q_nombre or "").strip().lower()
-                    n_col = lv["Nombre"].astype(str).str.lower()
-                    lv = lv[n_col.str.contains(qn, regex=False, na=False)]
-                if sel_br != "(Todos)":
-                    lv = lv[lv["Broker"].astype(str) == sel_br]
-                if sel_orig != "(Todos)":
-                    lv = lv[lv["Origen FIFO"].astype(str) == sel_orig]
-                if sel_est != "(Todos)":
-                    lv = lv[lv["Estado"].astype(str) == sel_est]
-
-                if lv.empty:
-                    st.warning("Ningún lote cumple los filtros.")
-                else:
-                    lv = lv.copy()
-                    if sel_sort == "Fecha lote (cronológico)":
-                        lv["_fd"] = pd.to_datetime(lv["Fecha lote"], errors="coerce")
-                        lv = lv.sort_values(["_fd", "Ticker"], ascending=[True, True]).drop(columns=["_fd"])
-                    elif sel_sort == "Fecha lote (reciente primero)":
-                        lv["_fd"] = pd.to_datetime(lv["Fecha lote"], errors="coerce")
-                        lv = lv.sort_values(["_fd", "Ticker"], ascending=[False, True]).drop(columns=["_fd"])
-                    elif sel_sort == "Ticker A-Z":
-                        lv = lv.sort_values(["Ticker", "Fecha lote"], ascending=[True, True])
-                    elif sel_sort == "Estado: Vivo → Parcial → Agotado":
-                        _ord_map = {"Vivo": 0, "Parcial": 1, "Agotado": 2}
-                        lv["_so"] = lv["Estado"].map(lambda x: _ord_map.get(str(x).strip(), 9))
-                        lv = lv.sort_values(["_so", "Fecha lote", "Ticker"], ascending=[True, True, True]).drop(
-                            columns=["_so"]
-                        )
-                    elif sel_sort == "% consumido (mayor a menor)":
-                        lv = lv.sort_values(["% consumido", "Fecha lote"], ascending=[False, True])
-                    else:
-                        lv = lv.sort_values(["% consumido", "Fecha lote"], ascending=[True, True])
-                    lv = lv.reset_index(drop=True)
-                    st.caption(f"**{len(lv)}** fila(s) mostradas · **{n_tot}** lotes en total (sin filtrar).")
-                    st.dataframe(
-                        lv.style.apply(style_fifo_lote_estado_row, axis=1),
-                        use_container_width=True,
-                    )
-                    st.subheader("Totales (ejercicio · lotes visibles)")
-                    st.caption(
-                        f"Suma de **tramos FIFO** con fecha de venta en **{ejercicio}** que corresponden a los lotes de la tabla "
-                        "(mismo origen, broker, ticker Yahoo, fecha de lote y precio medio). Útil para cotejar con declaraciones tipo Zergabidea. "
-                        "**Ganancia** y **Pérdida** acumulan por separado el resultado de cada tramo (±); en el mismo filtrado puede haber "
-                        "ventas a ganancia y a pérdida. **Plusvalía neta** es la suma algebraica de todos los tramos."
-                    )
-                    _t_vis = fifo_tramos_ejercicio_totales_para_lotes_visibles(lv, sales_detail_ejercicio)
-                    if _t_vis["n_tramos"] == 0:
-                        st.info(
-                            "No hay tramos del ejercicio enlazados a estos lotes (sin coincidencia de claves o sin detalle FIFO en el año)."
-                        )
-                    else:
-                        _fa_s = ""
-                        if "Fecha lote" in lv.columns:
-                            _fd_lo = pd.to_datetime(lv["Fecha lote"], errors="coerce").dropna()
-                            if len(_fd_lo):
-                                _fa_s = pd.Timestamp(_fd_lo.min()).strftime("%Y-%m-%d")
-                        _fv = _t_vis.get("fechas_venta") or []
-                        _ft_s = ", ".join(_fv) if _fv else "—"
-                        m1, m2, m3, m4, m5 = st.columns(5)
-                        with m1:
-                            st.metric("Tramos (filas)", f"{_t_vis['n_tramos']}")
-                        with m2:
-                            st.metric("Valor adquisición (€)", fmt_eur(_t_vis["adquisicion"]))
-                            st.caption(f"Fecha adquisición: {_fa_s or '—'}")
-                        with m3:
-                            st.metric("Valor transmisión (€)", fmt_eur(_t_vis["transmision"]))
-                            st.caption(
-                                f"Fecha(s) transmisión: {_ft_s}"
-                                + (" (varias ventas en el ejercicio)" if len(_fv) > 1 else "")
-                            )
-                        _per_e = abs(_t_vis["perdida"]) if _t_vis["perdida"] < 0 else 0.0
-                        with m4:
-                            _st_metric_colored(
-                                "Ganancia (€)",
-                                fmt_eur(_t_vis["ganancia"]),
-                                _plusvalia_color_css(_t_vis["ganancia"]),
-                            )
-                        with m5:
-                            _st_metric_colored(
-                                "Pérdida (€)",
-                                fmt_eur(_per_e),
-                                "#c62828" if _per_e > 0 else "#9e9e9e",
-                            )
-                        _c_n = _plusvalia_color_css(_t_vis["neto"])
-                        st.markdown(
-                            f"<p style='color:{_c_n}; font-size:0.875rem; margin:0.35rem 0 0 0;'>"
-                            f"<strong>Plusvalía neta</strong> (ganancia + pérdidas): {fmt_eur(_t_vis['neto'])}</p>",
-                            unsafe_allow_html=True,
-                        )
-                        st.caption(
-                            "Adquisición = fecha de lote más antigua entre filas visibles. "
-                            f"Transmisión = todas las fechas de venta del ejercicio **{ejercicio}** en esos tramos. "
-                            "En Renta declaras cada transmisión con su día concreto."
-                        )
-                        _desg_fv = fifo_tramos_ejercicio_desglose_por_fecha_venta(lv, sales_detail_ejercicio)
-                        if not _desg_fv.empty:
-                            st.markdown("**Desglose por fecha de venta** (mismos lotes filtrados)")
-                            _fmt_d = {
-                                c: fmt_eur
-                                for c in _desg_fv.columns
-                                if "€" in str(c) and c != "Fecha venta"
-                            }
-                            st.dataframe(
-                                _desg_fv.style.format(_fmt_d, na_rep="–"),
-                                use_container_width=True,
-                            )
-
-            st.subheader("Posiciones vivas (FIFO por lotes)")
-            if lots_df.empty:
-                st.info("No hay lotes vivos.")
-            else:
-                lots_show = lots_df.sort_values(["Broker", "Ticker", "Fecha origen"]).copy()
-                for old, new in [("ticker", "Ticker"), ("broker", "Broker"), ("nombre", "Nombre")]:
-                    if old in lots_show.columns and new not in lots_show.columns:
-                        lots_show = lots_show.rename(columns={old: new})
-                col_order = [c for c in ["Ticker", "ISIN", "Broker", "Nombre", "Fecha origen", "Cantidad", "Precio medio €", "Tipo activo"] if c in lots_show.columns]
-                st.dataframe(lots_show[col_order] if col_order else lots_show, use_container_width=True)
-
-            st.subheader("Ventas (impacto fiscal FIFO)")
-            st.caption(f"Solo ventas con **Fecha venta** en **{ejercicio}** (mismo criterio que el resumen superior).")
-            if sales_ejercicio.empty:
-                st.info("No hay ventas en este ejercicio.")
-            else:
-                sales_show = sales_ejercicio.sort_values(["Fecha venta", "Broker", "Ticker"]).copy()
-                col_order_s = [c for c in ["Ticker", "ISIN", "Broker", "Nombre", "Fecha venta", "Cantidad vendida", "Valor compra histórico (€)", "Valor venta (€)", "Plusvalía / Minusvalía (€)", "Retención dest. (€)", "Tipo activo"] if c in sales_show.columns]
-                st.dataframe(sales_show[col_order_s] if col_order_s else sales_show, use_container_width=True)
-                total_pnl = sales_show["Plusvalía / Minusvalía (€)"].sum() if "Plusvalía / Minusvalía (€)" in sales_show.columns else 0
-                _c_p = _plusvalia_color_css(total_pnl)
-                st.markdown(
-                    f"<p style='color:{_c_p};'><strong>Plusvalía/Minusvalía total (ejercicio {ejercicio})</strong>: "
-                    f"{fmt_eur(total_pnl)}</p>",
-                    unsafe_allow_html=True,
+            ff6, ff7, ff8, ff9, ff10 = st.columns(5)
+            with ff6:
+                sel_fv_u = st.selectbox(
+                    "Fecha venta", ["(Todas)"] + fechas_vta, key="fifo_un_fecha_vta"
                 )
-
-        with tab_fifo_tramos:
-            st.subheader("Desglose FIFO por lote consumido")
-            st.caption(
-                "Cada venta o permuta (switch) puede repartirse en varios tramos según los lotes "
-                "comprados. El valor de transmisión se reparte proporcionalmente por cantidad; "
-                "la última fila del tramo absorbe el redondeo para que coincida con el total de la venta."
+            with ff7:
+                sel_tipo_u = st.selectbox(
+                    "Tipo activo",
+                    tipo_opts,
+                    key="fifo_un_tipo_activo",
+                    help="Separa valores, ETFs, fondos, puts, calls… sin mezclar en la misma vista.",
+                )
+            with ff8:
+                sel_est_u = st.selectbox(
+                    "Estado lote",
+                    ["(Todos)", "Vivo", "Parcial", "Agotado"],
+                    key="fifo_un_estado",
+                )
+            with ff9:
+                sel_sort_tr_u = st.selectbox(
+                    "Orden tramos",
+                    [
+                        "Fecha venta → Fecha lote",
+                        "Fecha lote (cronológico)",
+                        "Ticker A-Z",
+                        "Año adq. (antiguo primero)",
+                        "Solo corrección primero",
+                    ],
+                    key="fifo_un_sort_tr",
+                )
+            with ff10:
+                sel_sort_led_u = st.selectbox(
+                    "Orden lotes",
+                    [
+                        "Fecha lote (cronológico)",
+                        "Fecha lote (reciente primero)",
+                        "Ticker A-Z",
+                        "Estado: Vivo → Parcial → Agotado",
+                        "% consumido (mayor a menor)",
+                        "% consumido (menor a mayor)",
+                    ],
+                    key="fifo_un_sort_led",
+                )
+            solo_consumo_ej_u = st.checkbox(
+                f"Solo lotes con ventas en {ejercicio}",
+                value=True,
+                key="fifo_un_solo_ej",
+                help="En la tabla de lotes, oculta filas sin «Consumida (ejercicio)» > 0.",
             )
-            if sales_detail_ejercicio.empty:
+
+            _fkw = dict(
+                q_ticker=q_ticker_u,
+                q_nombre=q_nombre_u,
+                sel_br=sel_br_u,
+                sel_orig=sel_orig_u,
+                sel_ant=sel_ant_u,
+                sel_fv=sel_fv_u,
+                sel_tipo=sel_tipo_u,
+            )
+            det_show = (
+                _fifo_filter_tramos_df(det_base, **_fkw)
+                if not det_base.empty
+                else pd.DataFrame()
+            )
+            tramo_keys = (
+                _fifo_lote_keys_from_tramos(det_show)
+                if sel_tipo_u != "(Todos)" and not det_show.empty
+                else None
+            )
+            lv = (
+                _fifo_filter_ledger_df(
+                    ledger_fifo,
+                    q_ticker=q_ticker_u,
+                    q_nombre=q_nombre_u,
+                    sel_br=sel_br_u,
+                    sel_orig=sel_orig_u,
+                    sel_ant=sel_ant_u,
+                    sel_fv=sel_fv_u,
+                    sel_est=sel_est_u,
+                    solo_consumo_ej=solo_consumo_ej_u,
+                    tramo_keys=tramo_keys,
+                )
+                if not ledger_fifo.empty
+                else pd.DataFrame()
+            )
+
+            st.divider()
+            st.markdown("### 1. Tramos del ejercicio")
+            st.caption(
+                "Una fila por tramo FIFO consumido en cada venta. Usa **Año adquisición** y **Corrección** "
+                "para preparar movimientos en Zergabidea."
+            )
+            if det_base.empty:
                 st.info("No hay tramos FIFO en este ejercicio.")
+            elif det_show.empty:
+                st.warning("Ningún tramo cumple los filtros.")
             else:
-                det_show = sales_detail_ejercicio.sort_values(
-                    ["Fecha venta", "Broker", "Ticker", "Fecha origen (lote)"],
-                    ascending=[True, True, True, True],
-                ).copy()
+                n_tot_tr = len(det_base)
+                det_show = _fifo_sort_tramos(det_show, sel_sort_tr_u)
+                st.caption(f"**{len(det_show)}** tramo(s) · **{n_tot_tr}** en total (sin filtrar).")
+                n_corr = int((det_show["Corrección"] == "Sí").sum())
+                if n_corr:
+                    st.caption(
+                        f"**{n_corr}** tramo(s) con **Corrección = Sí**; agrupa por **Año adq.** al volcar a Zergabidea."
+                    )
                 col_det = [
                     c for c in [
-                        "Origen FIFO", "Venta #", "Broker", "Ticker", "ISIN", "Ticker_Yahoo", "Nombre", "Tipo activo",
-                        "Tipo movimiento", "Fecha venta", "Cantidad venta (total)", "Cantidad (tramo)",
-                        "Fecha origen (lote)", "Valor compra histórico (€)", "Valor venta (€)",
-                        "Plusvalía / Minusvalía (€)",
+                        "Origen FIFO", "Venta #", "Broker", "Ticker", "ISIN", "Ticker_Yahoo", "Nombre",
+                        "Tipo activo", "Tipo movimiento", "Fecha venta", "Cantidad venta (total)",
+                        "Cantidad (tramo)", "Fecha origen (lote)", "Año adq.", "Corrección",
+                        "Valor compra histórico (€)", "Valor venta (€)", "Plusvalía / Minusvalía (€)",
                     ]
                     if c in det_show.columns
                 ]
-                sty = det_show[col_det].style.format(
+                det_disp = det_show[col_det].reset_index(drop=True)
+                sty_tr = det_disp.style.format(
                     {c: lambda x: fmt_eur(x) for c in col_det if "€" in str(c)},
                     na_rep="–",
                 )
-                pnl_cols = [c for c in col_det if "Plusvalía" in str(c)]
-                if pnl_cols:
-                    sty = _style_map(sty, color_pnl, subset=pnl_cols)
-                st.dataframe(sty, use_container_width=True)
-                with st.expander(
-                    "Cómo usar este CSV en el programa de Renta (p. ej. Zergabidea)",
-                    expanded=False,
-                ):
-                    st.markdown(
-                        """
-**Ejercicio en el filtro superior:** debe ser el **año de la venta** (transmisión que declaras), **no** el año en que compraste los lotes. Las compras aparecen en **Fecha origen (lote)**.
+                pnl_cols_tr = [c for c in col_det if "Plusvalía" in str(c)]
+                if pnl_cols_tr:
+                    sty_tr = _style_map(sty_tr, color_pnl, subset=pnl_cols_tr)
+                st.dataframe(sty_tr, use_container_width=True)
 
-**Columnas útiles**
+                _adq = pd.to_numeric(det_show.get("Valor compra histórico (€)"), errors="coerce").fillna(0.0).sum()
+                _vta = pd.to_numeric(det_show.get("Valor venta (€)"), errors="coerce").fillna(0.0).sum()
+                _pnl = pd.to_numeric(det_show.get("Plusvalía / Minusvalía (€)"), errors="coerce").fillna(0.0).sum()
+                tm1, tm2, tm3 = st.columns(3)
+                with tm1:
+                    st.metric("Σ Adquisición (tramos visibles)", fmt_eur(_adq))
+                with tm2:
+                    st.metric("Σ Transmisión (tramos visibles)", fmt_eur(_vta))
+                with tm3:
+                    _st_metric_colored("Σ G/P (tramos visibles)", fmt_eur(_pnl), _plusvalia_color_css(_pnl))
 
-| Columna | Significado |
-|--------|-------------|
-| **Venta #** | Mismo número = una misma venta partida en varios tramos FIFO. |
-| **ISIN** | Identificador del valor (movimiento o catálogo **Instrumentos**); puede ir vacío si falta mapeo. |
-| **Ticker_Yahoo** | Clave de cotización en la app. |
-| **Fecha venta** | Transmisión; suele repetirse en todas las filas de ese `Venta #`. |
-| **Fecha origen (lote)** | Compra de ese tramo (Hacienda aplicará el coeficiente que corresponda). |
-| **Valor compra histórico (€)** | Valor de adquisición de ese tramo para trasladar a la declaración. |
-| **Valor venta (€)** | Parte del valor de transmisión asignada a ese tramo. |
-
-**Trabajo habitual:** abre el CSV en una hoja de cálculo, ordena por **Venta #** y por **Fecha origen (lote)**. Para cada `Venta #`, o bien introduces **una línea en Renta por cada fila** (recomendable si hay varias fechas de compra), o bien agrupas por **año** de `Fecha origen (lote)` sumando compra y venta **solo si** tu programa lo admite con una sola fecha de adquisición por grupo.
-
-Los **coeficientes de actualización** y el cuadre final los calcula el **software de Hacienda**; este CSV no los incluye.
-
-**Comprueba:** la suma de **Valor venta (€)** de todas las filas con el mismo **Venta #** debe igualar el total de esa venta (la app reparte proporcionalmente y el último tramo absorbe el redondeo).
-"""
+                if n_corr and (det_show["Corrección"] == "No").any():
+                    _adq_corr = pd.to_numeric(
+                        det_show.loc[det_show["Corrección"] == "Sí", "Valor compra histórico (€)"],
+                        errors="coerce",
+                    ).fillna(0.0).sum()
+                    _vta_corr = pd.to_numeric(
+                        det_show.loc[det_show["Corrección"] == "Sí", "Valor venta (€)"],
+                        errors="coerce",
+                    ).fillna(0.0).sum()
+                    _adq_mismo = pd.to_numeric(
+                        det_show.loc[det_show["Corrección"] == "No", "Valor compra histórico (€)"],
+                        errors="coerce",
+                    ).fillna(0.0).sum()
+                    _vta_mismo = pd.to_numeric(
+                        det_show.loc[det_show["Corrección"] == "No", "Valor venta (€)"],
+                        errors="coerce",
+                    ).fillna(0.0).sum()
+                    st.markdown("**Desglose para Zergabidea (tramos visibles)**")
+                    zg = pd.DataFrame(
+                        [
+                            {
+                                "Grupo": "Año anterior (corrección)",
+                                "Tramos": n_corr,
+                                "Σ Adquisición (€)": _adq_corr,
+                                "Σ Transmisión (€)": _vta_corr,
+                            },
+                            {
+                                "Grupo": "Mismo año que venta",
+                                "Tramos": int((det_show["Corrección"] == "No").sum()),
+                                "Σ Adquisición (€)": _adq_mismo,
+                                "Σ Transmisión (€)": _vta_mismo,
+                            },
+                        ]
                     )
-                csv_bytes = det_show[col_det].to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig")
+                    st.dataframe(
+                        zg.style.format(
+                            {"Σ Adquisición (€)": fmt_eur, "Σ Transmisión (€)": fmt_eur},
+                            na_rep="–",
+                        ),
+                        use_container_width=True,
+                    )
+
+                csv_cols = [c for c in col_det if c in det_show.columns]
+                csv_bytes = det_show[csv_cols].to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig")
                 st.download_button(
-                    "Descargar CSV (detalle FIFO)",
+                    "Descargar CSV (tramos · filtrado)",
                     data=csv_bytes,
                     file_name=f"fiscalidad_fifo_tramos_{ejercicio}.csv",
                     mime="text/csv",
                     key="dl_fifo_tramos",
+                )
+
+            st.divider()
+            st.markdown("### 2. Estado de lotes")
+            st.caption(
+                "**Vivo**: sin consumir. **Parcial** (ámbar): parte vendida. **Agotado** (gris): todo consumido. "
+                "**Mismo año** = ✓ si compra y venta del ejercicio comparten año natural."
+            )
+            if ledger_fifo.empty:
+                st.info("No hay datos de lotes para mostrar.")
+            elif lv.empty:
+                st.warning("Ningún lote cumple los filtros.")
+            else:
+                n_tot_led = len(ledger_fifo)
+                lv = _fifo_sort_ledger(lv, sel_sort_led_u).reset_index(drop=True)
+                st.caption(f"**{len(lv)}** lote(s) · **{n_tot_led}** en total (sin filtrar).")
+                st.dataframe(
+                    lv.style.apply(style_fifo_lote_estado_row, axis=1),
+                    use_container_width=True,
+                )
+                _t_vis = fifo_tramos_ejercicio_totales_para_lotes_visibles(lv, sales_detail_ejercicio)
+                if _t_vis["n_tramos"] > 0:
+                    st.markdown("**Totales (lotes visibles → tramos del ejercicio)**")
+                    _fa_s = ""
+                    if "Fecha lote" in lv.columns:
+                        _fd_lo = pd.to_datetime(lv["Fecha lote"], errors="coerce").dropna()
+                        if len(_fd_lo):
+                            _fa_s = pd.Timestamp(_fd_lo.min()).strftime("%Y-%m-%d")
+                    _fv = _t_vis.get("fechas_venta") or []
+                    _ft_s = ", ".join(_fv) if _fv else "—"
+                    m1, m2, m3, m4, m5 = st.columns(5)
+                    with m1:
+                        st.metric("Tramos", f"{_t_vis['n_tramos']}")
+                    with m2:
+                        st.metric("Valor adquisición (€)", fmt_eur(_t_vis["adquisicion"]))
+                        st.caption(f"Fecha adq. más antigua: {_fa_s or '—'}")
+                    with m3:
+                        st.metric("Valor transmisión (€)", fmt_eur(_t_vis["transmision"]))
+                        st.caption(f"Fecha(s) venta: {_ft_s}")
+                    _per_e = abs(_t_vis["perdida"]) if _t_vis["perdida"] < 0 else 0.0
+                    with m4:
+                        _st_metric_colored(
+                            "Ganancia (€)", fmt_eur(_t_vis["ganancia"]), _plusvalia_color_css(_t_vis["ganancia"])
+                        )
+                    with m5:
+                        _st_metric_colored(
+                            "Pérdida (€)", fmt_eur(_per_e), "#c62828" if _per_e > 0 else "#9e9e9e"
+                        )
+                    _c_n = _plusvalia_color_css(_t_vis["neto"])
+                    st.markdown(
+                        f"<p style='color:{_c_n}; font-size:0.875rem;'>"
+                        f"<strong>Plusvalía neta</strong>: {fmt_eur(_t_vis['neto'])}</p>",
+                        unsafe_allow_html=True,
+                    )
+                    _desg_fv = fifo_tramos_ejercicio_desglose_por_fecha_venta(lv, sales_detail_ejercicio)
+                    if not _desg_fv.empty:
+                        st.markdown("**Desglose por fecha de venta** (lotes visibles)")
+                        _fmt_d = {c: fmt_eur for c in _desg_fv.columns if "€" in str(c) and c != "Fecha venta"}
+                        st.dataframe(_desg_fv.style.format(_fmt_d, na_rep="–"), use_container_width=True)
+
+            with st.expander("3. Ventas del ejercicio y posiciones vivas", expanded=False):
+                st.markdown("**Ventas (impacto fiscal FIFO)**")
+                st.caption(f"Solo ventas con **Fecha venta** en **{ejercicio}**.")
+                if sales_ejercicio.empty:
+                    st.info("No hay ventas en este ejercicio.")
+                else:
+                    sales_show = sales_ejercicio.sort_values(["Fecha venta", "Broker", "Ticker"]).copy()
+                    if (q_ticker_u or "").strip():
+                        qt = (q_ticker_u or "").strip().lower()
+                        sales_show = sales_show[
+                            sales_show["Ticker"].astype(str).str.lower().str.contains(qt, regex=False, na=False)
+                            | sales_show.get("Ticker_Yahoo", pd.Series([""] * len(sales_show))).astype(str).str.lower().str.contains(qt, regex=False, na=False)
+                        ]
+                    if sel_br_u != "(Todos)":
+                        sales_show = sales_show[sales_show["Broker"].astype(str) == sel_br_u]
+                    col_order_s = [
+                        c for c in [
+                            "Ticker", "ISIN", "Broker", "Nombre", "Fecha venta", "Cantidad vendida",
+                            "Valor compra histórico (€)", "Valor venta (€)", "Plusvalía / Minusvalía (€)",
+                            "Retención dest. (€)", "Tipo activo",
+                        ]
+                        if c in sales_show.columns
+                    ]
+                    st.dataframe(sales_show[col_order_s] if col_order_s else sales_show, use_container_width=True)
+                    total_pnl = (
+                        sales_show["Plusvalía / Minusvalía (€)"].sum()
+                        if "Plusvalía / Minusvalía (€)" in sales_show.columns
+                        else 0
+                    )
+                    _c_p = _plusvalia_color_css(total_pnl)
+                    st.markdown(
+                        f"<p style='color:{_c_p};'><strong>Plusvalía/Minusvalía total</strong>: "
+                        f"{fmt_eur(total_pnl)}</p>",
+                        unsafe_allow_html=True,
+                    )
+
+                st.markdown("**Posiciones vivas (FIFO por lotes)**")
+                if lots_df.empty:
+                    st.info("No hay lotes vivos.")
+                else:
+                    lots_show = lots_df.sort_values(["Broker", "Ticker", "Fecha origen"]).copy()
+                    if (q_ticker_u or "").strip():
+                        qt = (q_ticker_u or "").strip().lower()
+                        lots_show = lots_show[
+                            lots_show["Ticker"].astype(str).str.lower().str.contains(qt, regex=False, na=False)
+                            | lots_show.get("Ticker_Yahoo", pd.Series([""] * len(lots_show))).astype(str).str.lower().str.contains(qt, regex=False, na=False)
+                        ]
+                    if sel_br_u != "(Todos)":
+                        lots_show = lots_show[lots_show["Broker"].astype(str) == sel_br_u]
+                    col_order = [
+                        c for c in [
+                            "Ticker", "ISIN", "Broker", "Nombre", "Fecha origen", "Cantidad",
+                            "Precio medio €", "Tipo activo",
+                        ]
+                        if c in lots_show.columns
+                    ]
+                    st.dataframe(lots_show[col_order] if col_order else lots_show, use_container_width=True)
+
+            with st.expander("Cómo usar estos datos en Zergabidea", expanded=False):
+                st.markdown(
+                    """
+**Ejercicio** (filtro superior de Fiscalidad): año de la **venta**, no el de la compra.
+
+| Bloque | Uso |
+|--------|-----|
+| **Tramos** | Una fila = un tramo FIFO. Copia **Fecha origen (lote)**, **Valor compra histórico (€)**, **Fecha venta**, **Valor venta (€)**. |
+| **Corrección = Sí** | Compra en año anterior → movimiento aparte en Zergabidea (coeficiente lo calcula el programa). |
+| **Estado de lotes** | Inventario: qué queda vivo o agotado; **Mismo año** = ✓ si no hay corrección. |
+
+Agrupa tramos por **Venta #** + **Año adq.** si quieres una línea por grupo en la declaración.
+"""
                 )
 
         with tab_regla_2m:
