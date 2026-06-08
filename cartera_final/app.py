@@ -4505,6 +4505,53 @@ def _fifo_mask_tipo_sel(tipo_series: pd.Series, sel_tipo: str) -> pd.Series:
     return pd.Series(False, index=tipo_series.index)
 
 
+def _fifo_build_apuntes_declaracion(det: pd.DataFrame) -> pd.DataFrame:
+    """Agrupa tramos filtrados en apuntes para Zergabidea (tipo + corrección + año adq.)."""
+    _cols = [
+        "Tipo", "Grupo", "Año adq.", "Tramos",
+        "Σ Adquisición (€)", "Σ Transmisión (€)", "G/P (€)",
+    ]
+    if det is None or det.empty:
+        return pd.DataFrame(columns=_cols)
+    d = det.copy()
+    tipo_col = d.get("Tipo activo", pd.Series([""] * len(d), index=d.index))
+    d["_tipo_lbl"] = tipo_col.map(_fifo_tipo_label)
+    corr = d.get("Corrección", pd.Series(["No"] * len(d), index=d.index)).astype(str)
+    d["_grupo"] = np.where(corr == "Sí", "Año anterior (corrección)", "Mismo año que venta")
+    if "Año adq." in d.columns:
+        d["_ano_str"] = d["Año adq."].astype(str).str.strip()
+    elif "_ano_adq" in d.columns:
+        d["_ano_str"] = d["_ano_adq"].apply(lambda y: str(int(y)) if pd.notna(y) else "")
+    else:
+        d["_ano_str"] = ""
+    d["_adq"] = pd.to_numeric(d.get("Valor compra histórico (€)"), errors="coerce").fillna(0.0)
+    d["_vta"] = pd.to_numeric(d.get("Valor venta (€)"), errors="coerce").fillna(0.0)
+    d["_pnl"] = pd.to_numeric(d.get("Plusvalía / Minusvalía (€)"), errors="coerce").fillna(0.0)
+    agg = (
+        d.groupby(["_tipo_lbl", "_grupo", "_ano_str"], as_index=False)
+        .agg(
+            Tramos=("_adq", "count"),
+            **{
+                "Σ Adquisición (€)": ("_adq", "sum"),
+                "Σ Transmisión (€)": ("_vta", "sum"),
+                "G/P (€)": ("_pnl", "sum"),
+            },
+        )
+        .rename(columns={"_tipo_lbl": "Tipo", "_grupo": "Grupo", "_ano_str": "Año adq."})
+    )
+    tipo_ord = {t: i for i, t in enumerate(_FIFO_TIPO_FILTER_ORDER)}
+    agg["_sort_tipo"] = agg["Tipo"].map(lambda t: tipo_ord.get(t, 99))
+    agg["_sort_grupo"] = agg["Grupo"].map(
+        {"Año anterior (corrección)": 0, "Mismo año que venta": 1}
+    ).fillna(2)
+    agg["_sort_ano"] = pd.to_numeric(agg["Año adq."], errors="coerce").fillna(0)
+    return (
+        agg.sort_values(["_sort_tipo", "_sort_grupo", "_sort_ano"])
+        .drop(columns=["_sort_tipo", "_sort_grupo", "_sort_ano"])
+        .reset_index(drop=True)[_cols]
+    )
+
+
 def _fifo_first_nonempty(series: pd.Series) -> str:
     """Primer valor no vacío en la columna (p. ej. nombre/ticker repetidos en tramos de una misma venta)."""
     for x in series:
@@ -9499,6 +9546,53 @@ def main() -> None:
                 if not ledger_fifo.empty
                 else pd.DataFrame()
             )
+
+            st.divider()
+            st.markdown("### Apuntes declaración")
+            st.caption(
+                "Resumen agrupado de los tramos **visibles con los filtros actuales**. "
+                "Cada fila ≈ **un movimiento en Zergabidea** (tipo de activo + grupo de corrección + año de adquisición). "
+                "Los importes coinciden con la suma de §1 Tramos."
+            )
+            if det_base.empty:
+                st.info("No hay tramos en este ejercicio.")
+            elif det_show.empty:
+                st.warning("Ningún apunte: ajusta los filtros.")
+            else:
+                apuntes_df = _fifo_build_apuntes_declaracion(det_show)
+                st.caption(
+                    f"**{len(apuntes_df)}** apunte(s) · **{len(det_show)}** tramo(s) agrupados."
+                )
+                ap_cols = list(apuntes_df.columns)
+                sty_ap = apuntes_df.style.format(
+                    {
+                        "Σ Adquisición (€)": fmt_eur,
+                        "Σ Transmisión (€)": fmt_eur,
+                        "G/P (€)": fmt_eur,
+                    },
+                    na_rep="–",
+                )
+                if "G/P (€)" in ap_cols:
+                    sty_ap = _style_map(sty_ap, color_pnl, subset=["G/P (€)"])
+                st.dataframe(sty_ap, use_container_width=True)
+                _ap_adq = pd.to_numeric(apuntes_df["Σ Adquisición (€)"], errors="coerce").fillna(0.0).sum()
+                _ap_vta = pd.to_numeric(apuntes_df["Σ Transmisión (€)"], errors="coerce").fillna(0.0).sum()
+                _ap_pnl = pd.to_numeric(apuntes_df["G/P (€)"], errors="coerce").fillna(0.0).sum()
+                ap1, ap2, ap3 = st.columns(3)
+                with ap1:
+                    st.metric("Σ Adquisición (apuntes)", fmt_eur(_ap_adq))
+                with ap2:
+                    st.metric("Σ Transmisión (apuntes)", fmt_eur(_ap_vta))
+                with ap3:
+                    _st_metric_colored("Σ G/P (apuntes)", fmt_eur(_ap_pnl), _plusvalia_color_css(_ap_pnl))
+                ap_csv = apuntes_df.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig")
+                st.download_button(
+                    "Descargar CSV (apuntes · filtrado)",
+                    data=ap_csv,
+                    file_name=f"fiscalidad_apuntes_{ejercicio}.csv",
+                    mime="text/csv",
+                    key="dl_fifo_apuntes",
+                )
 
             st.divider()
             st.markdown("### 1. Tramos del ejercicio")
