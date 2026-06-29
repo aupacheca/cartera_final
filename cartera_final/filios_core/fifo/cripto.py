@@ -103,6 +103,7 @@ def compute_fifo_criptos(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, 
     Reglas:
     - buy / switchBuy: crean lotes (cantidad y coste histórico en EUR).
     - sell / switch: consumen lotes FIFO global del ticker y generan plusvalía/minusvalía.
+      Comisión en la misma cripto: consume adicionalmente del FIFO (fee aparte del qty vendido).
     - stakeReward: crea lotes con coste 0 (ganancia futura al vender).
     - brokerTransfer: neutro fiscalmente (se ignora para FIFO global).
     - commission: si la cantidad es en cripto (positionNumber > 0), consume FIFO global como la cartera
@@ -172,8 +173,14 @@ def compute_fifo_criptos(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, 
 
         # Compras (incluye permutas de entrada)
         if tipo in ("buy", "switchbuy"):
-            cost_eur = total_eur
-            price_eur = cost_eur / qty if qty > 0 else 0.0
+            com_val_b = _to_float(row.get("comission"), 0.0)
+            com_ccy_b = str(row.get("comissionCurrency") or "").strip().upper()
+            qty_net, cost_eur = _crypto_buy_net_qty_cost(
+                qty, total_eur, com_val=com_val_b, com_ccy=com_ccy_b, ticker=ticker
+            )
+            if qty_net <= 0:
+                continue
+            price_eur = cost_eur / qty_net if qty_net > 0 else 0.0
             lots_by_ticker[ticker].append(
                 {
                     "Broker": broker,
@@ -181,7 +188,7 @@ def compute_fifo_criptos(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, 
                     "ISIN": isin_c,
                     "Nombre": nombre,
                     "Fecha origen": date_str,
-                    "Cantidad": qty,
+                    "Cantidad": qty_net,
                     "Precio medio €": price_eur,
                     "Coste histórico €": cost_eur,
                     "Tipo activo": "crypto",
@@ -225,6 +232,10 @@ def compute_fifo_criptos(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, 
 
             lots = lots_by_ticker.get(ticker, [])
             new_lots, tranches = _consume_fifo_lotes_cripto_global_detail(lots, qty)
+            comm_out = _to_float(row.get("comission"), 0.0)
+            comm_ccy_out = str(row.get("comissionCurrency") or "").strip().upper()
+            if comm_out > 0 and comm_ccy_out == ticker:
+                new_lots, _ = _consume_fifo_lotes_cripto_global(new_lots, comm_out)
             lots_by_ticker[ticker] = new_lots
             cost_hist = sum(t["consumed"] * t["Precio medio €"] for t in tranches)
 
@@ -325,6 +336,52 @@ def _consume_lots_fifo(lots: list[dict], qty_to_consume: float) -> float:
     return cost_consumed
 
 
+def _consume_crypto_outflow(
+    lots: list[dict],
+    qty: float,
+    *,
+    com_val: float,
+    com_ccy: str,
+    ticker: str,
+) -> None:
+    """
+    Venta/permuta de salida: consume qty vendida/permutada.
+    Si la comisión es en la misma cripto, la descuenta además (fee aparte, como en Kraken).
+    """
+    total_q = sum(l["qty"] for l in lots)
+    if qty <= 0 or total_q <= 0:
+        return
+    _consume_lots_fifo(lots, min(qty, total_q))
+    if com_val > 0 and str(com_ccy or "").strip().upper() == ticker:
+        total_q = sum(l["qty"] for l in lots)
+        if total_q > 0:
+            _consume_lots_fifo(lots, min(com_val, total_q))
+
+
+def _crypto_buy_net_qty_cost(
+    qty_gross: float,
+    cost_eur: float,
+    *,
+    com_val: float,
+    com_ccy: str,
+    ticker: str,
+) -> tuple[float, float]:
+    """
+    Compra / switchBuy cripto: cantidad neta en cartera y coste € del lote.
+    - Comisión en la misma cripto: resta del qty; el coste € pagado (fiat) se mantiene íntegro.
+    - Comisión en EUR: qty bruta; coste € = totalWithComissionBaseCurrency (incluye comisión).
+    """
+    t = str(ticker or "").strip().upper()
+    if t.endswith("-EUR"):
+        t = t[:-4]
+    cc = str(com_ccy or "").strip().upper()
+    q = max(0.0, float(qty_gross))
+    cost = float(cost_eur)
+    if cc == t and com_val > 0:
+        q = max(0.0, q - com_val)
+    return q, cost
+
+
 def compute_positions_criptos(
     df: pd.DataFrame, *, use_kraken_ledger_override: bool = True
 ) -> pd.DataFrame:
@@ -332,7 +389,7 @@ def compute_positions_criptos(
     Calcula posiciones de cripto por broker y ticker a partir de movimientos_criptos.
     Usa FIFO para ventas, switch y traspasos (como Filios).
     - buy / switchBuy: añade lote FIFO.
-    - sell / switch: consume lotes FIFO.
+    - sell / switch: consume lotes FIFO (comisión en misma cripto = fee adicional al qty vendido).
     - brokerTransfer: mueve lotes FIFO de origen a destino.
     - commission: consume cantidad FIFO (sin coste).
     - stakeReward: añade lote con coste 0.
@@ -400,12 +457,9 @@ def compute_positions_criptos(
         dest = CRYPTO_BROKER_IDS.get(dest_raw, dest_raw if dest_raw else "")
 
         if tipo == "buy":
-            # Comisión en misma moneda: reducir qty y coste proporcionalmente (la comisión no aumenta la base)
-            qty_orig = qty
-            if com_ccy == ticker and com_val > 0:
-                qty = max(0.0, qty - com_val)
-                # Coste solo sobre la cantidad neta recibida
-                total_eur = total_eur * (qty / qty_orig) if qty_orig > 0 else 0.0
+            qty, total_eur = _crypto_buy_net_qty_cost(
+                qty, total_eur, com_val=com_val, com_ccy=com_ccy, ticker=ticker
+            )
             if qty <= 0:
                 continue
             key = ensure(broker, ticker, row)
@@ -415,21 +469,22 @@ def compute_positions_criptos(
             lots = positions[key]["lots"]
             if qty <= 0:
                 continue
-            _consume_lots_fifo(lots, min(qty, sum(l["qty"] for l in lots)))
+            _consume_crypto_outflow(
+                lots, qty, com_val=com_val, com_ccy=com_ccy, ticker=ticker
+            )
         elif tipo == "switch":
-            if com_ccy == ticker and com_val > 0:
-                qty = max(0.0, qty - com_val)
             key = ensure(broker, ticker, row)
             lots = positions[key]["lots"]
             total_q = sum(l["qty"] for l in lots)
             if qty <= 0 or total_q <= 0:
                 continue
-            _consume_lots_fifo(lots, min(qty, total_q))
+            _consume_crypto_outflow(
+                lots, qty, com_val=com_val, com_ccy=com_ccy, ticker=ticker
+            )
         elif tipo == "switchbuy":
-            qty_orig = qty
-            if com_ccy == ticker and com_val > 0:
-                qty = max(0.0, qty - com_val)
-                total_eur = total_eur * (qty / qty_orig) if qty_orig > 0 else 0.0
+            qty, total_eur = _crypto_buy_net_qty_cost(
+                qty, total_eur, com_val=com_val, com_ccy=com_ccy, ticker=ticker
+            )
             if qty <= 0:
                 continue
             key = ensure(broker, ticker, row)
@@ -487,8 +542,9 @@ def compute_positions_criptos(
         pos_df = pd.DataFrame(rows_pos)
         return pos_df.sort_values(["Broker", "Ticker"]).reset_index(drop=True)
 
-    # Ajuste Kraken BTC con ledger oficial: solo mostrar si hay saldo > 0
-    # Si no hay ledger o saldo 0, eliminar Kraken para no mostrar posiciones obsoletas
+    # Ajuste Kraken BTC con ledger oficial (histórico importado).
+    # Si el ledger indica saldo > 0, prevalece sobre FIFO. Si indica 0, solo ocultamos Kraken/BTC
+    # cuando FIFO también está a cero; si hay compras nuevas en movimientos_criptos, se muestra FIFO.
     ledger_path = DATA_DIR / "kraken_stocks_etfs_ledgers_2025-01-13-2025-12-31.csv"
     kraken_btc: float | None = None
     if ledger_path.exists():
@@ -522,20 +578,23 @@ def compute_positions_criptos(
                     kraken_btc = 0.0
         except Exception:
             kraken_btc = None
-    # Sin ledger o saldo 0: eliminar Kraken
-    if kraken_btc is None or kraken_btc == 0.0:
-        for k in [("Kraken", "BTC")]:
-            positions.pop(k, None)
-            meta.pop(k, None)
-    else:
-        # Saldo > 0: añadir o actualizar
-        positions[("Kraken", "BTC")] = kraken_btc
-        meta[("Kraken", "BTC")] = {
+
+    kraken_key = ("Kraken", "BTC")
+    fifo_kraken_qty = 0.0
+    if kraken_key in positions and isinstance(positions[kraken_key], dict):
+        fifo_kraken_qty = sum(l["qty"] for l in positions[kraken_key].get("lots", []))
+
+    if kraken_btc is not None and kraken_btc > 0:
+        positions[kraken_key] = kraken_btc
+        meta[kraken_key] = {
             "Broker": "Kraken",
             "Ticker": "BTC",
             "Ticker_Yahoo": "BTC-EUR",
             "Nombre": "Bitcoin",
         }
+    elif kraken_btc == 0.0 and fifo_kraken_qty < MIN_POSITION:
+        positions.pop(kraken_key, None)
+        meta.pop(kraken_key, None)
 
     # Construir DataFrame de posiciones abiertas (solo brokers con saldo > 0)
     rows_pos: list[dict] = []
