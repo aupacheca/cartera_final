@@ -1114,6 +1114,33 @@ def _init_db_criptos():
     _ensure_movimientos_criptos_schema()
 
 
+def _crypto_ticker_base(ticker: str) -> str:
+    """Ticker cripto sin sufijo -EUR (p. ej. BTC-EUR → BTC)."""
+    t = str(ticker or "").strip().upper()
+    if t.endswith("-EUR"):
+        t = t[:-4]
+    return t
+
+
+def _crypto_fee_currency_options(
+    currencies_in_data: list[str],
+    *,
+    position_ticker: str,
+    catalog_criptos: pd.DataFrame,
+) -> list[str]:
+    """Monedas fiat habituales + tickers cripto para comisión/impuestos."""
+    extra: set[str] = set()
+    pt = _crypto_ticker_base(position_ticker)
+    if pt:
+        extra.add(pt)
+    if catalog_criptos is not None and not catalog_criptos.empty:
+        for _, row in catalog_criptos.iterrows():
+            tk = _crypto_ticker_base(str(row.get("ticker") or ""))
+            if tk:
+                extra.add(tk)
+    return sorted(set(currencies_in_data) | extra)
+
+
 def append_operation_criptos(new_row: dict) -> None:
     """Añade una fila a la tabla movimientos_criptos."""
     _init_db_criptos()
@@ -6074,8 +6101,20 @@ def main() -> None:
                     es_posicion_nueva = pos_origen == "No, es una posición nueva"
 
                     default_ccy_for_fees = (position_currency or "EUR").strip()
-                    if default_ccy_for_fees not in currencies_in_data:
+                    if tipo_registro == "Criptos" and position_ticker:
+                        _fee_crypto = _crypto_ticker_base(position_ticker)
+                        if _fee_crypto:
+                            default_ccy_for_fees = _fee_crypto
+                    if default_ccy_for_fees not in currencies_in_data and tipo_registro != "Criptos":
                         default_ccy_for_fees = "EUR" if "EUR" in currencies_in_data else currencies_in_data[0]
+                    elif tipo_registro == "Criptos":
+                        _fee_opts_pre = _crypto_fee_currency_options(
+                            currencies_in_data,
+                            position_ticker=position_ticker or "",
+                            catalog_criptos=catalog_criptos,
+                        )
+                        if default_ccy_for_fees not in _fee_opts_pre:
+                            default_ccy_for_fees = "EUR" if "EUR" in _fee_opts_pre else _fee_opts_pre[0]
                     _ccy_sync_sig = (str(sel_pos), str(tipo_registro), default_ccy_for_fees)
                     if "last_pos_for_ccy" not in st.session_state or st.session_state["last_pos_for_ccy"] != _ccy_sync_sig:
                         st.session_state["ccy_com"] = default_ccy_for_fees
@@ -6986,7 +7025,15 @@ def main() -> None:
                                             st.warning("No se pudo obtener el tipo de cambio intradía para ese momento. Prueba con cierre del día o introduce el valor a mano.")
                         auto_fx = st.toggle("AutoFx", value=False, help="Tipo de cambio automático del broker", key="auto_fx_nuevo")
 
-                        ccy_options = currencies_in_data
+                        ccy_options = (
+                            _crypto_fee_currency_options(
+                                currencies_in_data,
+                                position_ticker=position_ticker or "",
+                                catalog_criptos=catalog_criptos,
+                            )
+                            if tipo_registro == "Criptos"
+                            else list(currencies_in_data)
+                        )
                         cc1, cc2, cc3 = st.columns(3)
                         with cc1:
                             _com_str = st.text_input("Comisión", placeholder="0 o 0,00", key="op_com_nuevo")
