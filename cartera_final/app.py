@@ -41,6 +41,9 @@ from filios_core.constants import (
     POSITION_FORM_CURRENCIES,
 )
 from filios_core.db import get_db as _get_db
+# Visible en la barra lateral para comprobar que HA ha desplegado esta build.
+ADDON_BUILD = "1.0.26"
+
 from filios_core.fifo import (
     _cripto_chrono_type_order,
     _fifo_queue_key_stocks,
@@ -64,6 +67,9 @@ from filios_core.isin import (
     _resolve_movimiento_isin,
     lookup_ticker_yahoo_by_isin,
 )
+
+# Visible en la barra lateral para comprobar que HA ha desplegado esta build.
+ADDON_BUILD = "1.0.26"
 
 
 _MADRID_TZ = ZoneInfo("Europe/Madrid")
@@ -3044,7 +3050,7 @@ def positions_base_cartera_unificada(df_acciones: pd.DataFrame) -> pd.DataFrame:
     positions_fondos_df = positions_fondos_to_dataframe(compute_positions_fondos(df_fondos))
     positions_fondos_df["Origen"] = "Fondos"
     df_crip = load_data_criptos()
-    positions_crip_df = compute_positions_criptos(df_crip)
+    positions_crip_df = compute_positions_criptos(df_crip, use_kraken_ledger_override=False)
     if not positions_crip_df.empty:
         positions_crip_df = positions_crip_df.rename(
             columns={
@@ -5635,7 +5641,7 @@ def _build_positions_base_cartera() -> pd.DataFrame:
     positions_fondos_df = positions_fondos_to_dataframe(compute_positions_fondos(df_fondos))
     positions_fondos_df["Origen"] = "Fondos"
     df_crip_cartera = load_data_criptos()
-    positions_crip_df = compute_positions_criptos(df_crip_cartera)
+    positions_crip_df = compute_positions_criptos(df_crip_cartera, use_kraken_ledger_override=False)
     if not positions_crip_df.empty:
         positions_crip_df = positions_crip_df.rename(
             columns={
@@ -5688,6 +5694,7 @@ def main() -> None:
         layout="wide",
     )
     st.title("Cartera de Inversión")
+    st.sidebar.caption(f"Build add-on: **{ADDON_BUILD}**")
 
     df = load_data()
 
@@ -5897,7 +5904,7 @@ def main() -> None:
         # Posiciones vivas por cuenta (para «Vender todo» en nueva operación)
         _pos_nueva_op_acc = compute_positions_fifo(df)
         _pos_nueva_op_fon = positions_fondos_to_dataframe(compute_positions_fondos(df_fondos_mov))
-        _pos_nueva_op_crip = compute_positions_criptos(df_crip_mov)
+        _pos_nueva_op_crip = compute_positions_criptos(df_crip_mov, use_kraken_ledger_override=False)
 
         tab_mov, tab_div = st.tabs(["Movimientos", "Dividendos"])
 
