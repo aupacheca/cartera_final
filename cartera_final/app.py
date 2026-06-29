@@ -1579,6 +1579,7 @@ def _recalc_totals(
     """
     Recalcula total, totalBaseCurrency, totalWithComission, totalWithComissionBaseCurrency.
     - Compras (buy, switchbuy): totalWithComission = totalBase + comisión + impuestos.
+      Si la comisión es en cripto (p. ej. BTC), no se suma al total €: reduce qty en FIFO.
     - Ventas (sell, switch): totalWithComission = totalBase - comisión - impuestos (lo que realmente recibes).
     """
     total_local = qty * price
@@ -1592,10 +1593,18 @@ def _recalc_totals(
         tax_local = tax if (tax_ccy or "").strip().upper() == (pos_ccy or "").strip().upper() else (tax_eur / fx if fx and abs(fx) > 1e-9 else 0.0)
         total_with_comm_local = total_local - comm_local - tax_local
     else:
-        total_with_comm_base = total_base + comm_eur + tax_eur
-        comm_local = comm if (comm_ccy or "").strip().upper() == (pos_ccy or "").strip().upper() else (comm_eur / fx if fx and abs(fx) > 1e-9 else 0.0)
-        tax_local = tax if (tax_ccy or "").strip().upper() == (pos_ccy or "").strip().upper() else (tax_eur / fx if fx and abs(fx) > 1e-9 else 0.0)
-        total_with_comm_local = total_local + comm_local + tax_local
+        comm_ccy_u = (comm_ccy or "").strip().upper()
+        pos_ccy_u = (pos_ccy or "").strip().upper()
+        tax_ccy_u = (tax_ccy or "").strip().upper()
+        tax_local = tax if tax_ccy_u == pos_ccy_u else (tax_eur / fx if fx and abs(fx) > 1e-9 else 0.0)
+        # Comisión en cripto (p. ej. BTC): no sumar al total €; la fee reduce qty en FIFO, no el fiat pagado.
+        if comm_ccy_u and comm_ccy_u not in ("", "EUR", pos_ccy_u):
+            total_with_comm_base = total_base + tax_eur
+            total_with_comm_local = total_local + tax_local
+        else:
+            total_with_comm_base = total_base + comm_eur + tax_eur
+            comm_local = comm if comm_ccy_u == pos_ccy_u else (comm_eur / fx if fx and abs(fx) > 1e-9 else 0.0)
+            total_with_comm_local = total_local + comm_local + tax_local
     return {
         "total": total_local,
         "totalBaseCurrency": total_base,
@@ -7038,7 +7047,17 @@ def main() -> None:
                         with cc1:
                             _com_str = st.text_input("Comisión", placeholder="0 o 0,00", key="op_com_nuevo")
                             op_commission = _to_float(_com_str, 0.0)
-                            op_commission_ccy = st.selectbox("Moneda comisión", ccy_options, key="ccy_com")
+                            op_commission_ccy = st.selectbox(
+                                "Moneda comisión",
+                                ccy_options,
+                                key="ccy_com",
+                                help=(
+                                    "En cripto: fee en BTC/ETH resta cantidad en cartera; "
+                                    "el total € pagado no cambia. En EUR: suma al coste."
+                                    if tipo_registro == "Criptos"
+                                    else None
+                                ),
+                            )
                         with cc2:
                             _tax_str = st.text_input("Impuestos (Tasa Tobin, Stamp Duty, etc.)", placeholder="0 o 0,00", key="op_tax_nuevo")
                             op_taxes = _to_float(_tax_str, 0.0)
