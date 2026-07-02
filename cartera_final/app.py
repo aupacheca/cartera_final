@@ -41,9 +41,6 @@ from filios_core.constants import (
     POSITION_FORM_CURRENCIES,
 )
 from filios_core.db import get_db as _get_db
-# Visible en la barra lateral para comprobar que HA ha desplegado esta build.
-ADDON_BUILD = "1.0.26"
-
 from filios_core.fifo import (
     _cripto_chrono_type_order,
     _fifo_queue_key_stocks,
@@ -68,8 +65,8 @@ from filios_core.isin import (
     lookup_ticker_yahoo_by_isin,
 )
 
-# Visible en la barra lateral para comprobar que HA ha desplegado esta build.
-ADDON_BUILD = "1.0.26"
+# Versión visible en PC y add-on. Al publicar el add-on, actualizar también cartera_final/config.yaml.
+APP_VERSION = "1.0.27"
 
 
 _MADRID_TZ = ZoneInfo("Europe/Madrid")
@@ -1069,6 +1066,37 @@ def apply_global_instrument_update(
     return True, f"Actualizado «{old_yahoo}» → datos guardados."
 
 
+def _ensure_spinoff_catalog_isins(df: pd.DataFrame | None) -> None:
+    """Rellena instrument_catalog con ISIN de hijas creadas por spin-off si aún no está guardado."""
+    if df is None or df.empty or "type" not in df.columns:
+        return
+    sp = df[df["type"].astype(str).str.strip().str.lower() == "spinoff"]
+    if sp.empty:
+        return
+    _init_instrument_catalog()
+    with _get_db() as conn:
+        changed = False
+        for _, r in sp.iterrows():
+            ty = str(r.get("switchBuyPosition") or "").strip()
+            iso = _norm_isin_field(str(r.get("spinOffBuyPosition") or ""))
+            if not ty or not iso:
+                continue
+            row = conn.execute(
+                "SELECT isin FROM instrument_catalog WHERE ticker_Yahoo = ? LIMIT 1",
+                (ty,),
+            ).fetchone()
+            if row and str(row[0] or "").strip():
+                continue
+            conn.execute("DELETE FROM instrument_catalog WHERE ticker_Yahoo = ?", (ty,))
+            conn.execute(
+                "INSERT INTO instrument_catalog (ticker_Yahoo, isin) VALUES (?, ?)",
+                (ty, iso),
+            )
+            changed = True
+        if changed:
+            conn.commit()
+
+
 def _num_to_csv(val):
     """Formatea número para CSV con coma decimal."""
     if val is None or (isinstance(val, float) and pd.isna(val)):
@@ -1481,6 +1509,7 @@ def load_data() -> pd.DataFrame:
             s = df[col].astype(str).str.strip().str.replace(",", ".", regex=False)
             df[col] = pd.to_numeric(s, errors="coerce")
 
+    _ensure_spinoff_catalog_isins(df)
     return df
 
 def _cripto_movimiento_tab_type_order(s: pd.Series) -> pd.Series:
@@ -5694,7 +5723,6 @@ def main() -> None:
         layout="wide",
     )
     st.title("Cartera de Inversión")
-    st.sidebar.caption(f"Build add-on: **{ADDON_BUILD}**")
 
     df = load_data()
 
@@ -5789,6 +5817,9 @@ def main() -> None:
             n, msg = recalc_all_totals(use_ecb_rates=True)
             st.success(msg)
             st.rerun()
+
+    st.sidebar.divider()
+    st.sidebar.caption(f"Versión **{APP_VERSION}**")
 
     if vista == "Catálogo":
         st.header("Catálogo de instrumentos")
@@ -7203,6 +7234,18 @@ def main() -> None:
                                         try:
                                             append_operation(new_row_spinoff)
                                             load_data.clear()
+                                            if _child_ref and _iso_child:
+                                                _init_instrument_catalog()
+                                                with _get_db() as conn:
+                                                    conn.execute(
+                                                        "DELETE FROM instrument_catalog WHERE ticker_Yahoo = ?",
+                                                        (_child_ref,),
+                                                    )
+                                                    conn.execute(
+                                                        "INSERT INTO instrument_catalog (ticker_Yahoo, isin) VALUES (?, ?)",
+                                                        (_child_ref, _iso_child),
+                                                    )
+                                                    conn.commit()
                                             if "nuevo_form_abierto" in st.session_state:
                                                 st.session_state["nuevo_form_abierto"] = False
                                             _clear_form_nueva_operacion()
