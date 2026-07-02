@@ -19,6 +19,7 @@ DIVIDENDOS_COLUMNS = [
 ]
 
 # Monedas habituales en el formulario de operaciones (se unen a las que ya hay en cartera).
+# Cubren la mayoría de brokers europeos/USA y Asia; tipos BCE vía Frankfurter suelen incluirlas.
 POSITION_FORM_CURRENCIES: tuple[str, ...] = (
     "AUD",
     "BGN",
