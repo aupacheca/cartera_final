@@ -66,7 +66,7 @@ from filios_core.isin import (
 )
 
 # Versión visible en PC y add-on. Al publicar el add-on, actualizar también cartera_final/config.yaml.
-APP_VERSION = "1.0.27"
+APP_VERSION = "1.0.28"
 
 
 _MADRID_TZ = ZoneInfo("Europe/Madrid")
