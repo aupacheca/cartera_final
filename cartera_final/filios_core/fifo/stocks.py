@@ -141,6 +141,65 @@ def compute_fifo_all(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.D
                 remaining -= take
             continue
 
+        # -------- TRASPASO entre brokers: retag o mueve lotes; no altera orden FIFO ni fechas --------
+        if tipo_lower == "brokertransfer":
+            dest_raw = _safe_get(row, "brokerTransferNewBroker")
+            if not dest_raw or broker is None:
+                continue
+            dest_broker = str(dest_raw).strip()
+            qty_tr = abs(_to_float(qty, 0.0))
+            if qty_tr <= MIN_POSITION:
+                continue
+            key_tr = _fifo_queue_key_stocks(row, broker, key_ticker, cat_cache)
+            lots_tr = lots_by_key.setdefault(key_tr, [])
+            br_src = str(broker or "").strip()
+            if key_tr[0] == "ISIN":
+                remaining = float(qty_tr)
+                i = 0
+                while remaining > MIN_POSITION and i < len(lots_tr):
+                    lote = lots_tr[i]
+                    lot_b = str(lote.get("Broker") or "").strip()
+                    lot_qty = float(lote.get("Cantidad") or 0.0)
+                    if lot_b != br_src or lot_qty <= MIN_POSITION:
+                        i += 1
+                        continue
+                    if lot_qty <= remaining + MIN_POSITION:
+                        lote["Broker"] = dest_broker
+                        remaining -= lot_qty
+                        i += 1
+                    else:
+                        moved_qty = remaining
+                        new_part = dict(lote)
+                        new_part["Cantidad"] = moved_qty
+                        new_part["Broker"] = dest_broker
+                        lote["Cantidad"] = lot_qty - moved_qty
+                        lots_tr.insert(i + 1, new_part)
+                        remaining = 0.0
+                continue
+            dst_key = ("PAIR", dest_broker, key_tr[2])
+            if dst_key not in lots_by_key:
+                lots_by_key[dst_key] = []
+            dst_lots = lots_by_key[dst_key]
+            remaining = float(qty_tr)
+            while remaining > MIN_POSITION and lots_tr:
+                lote = lots_tr[0]
+                lot_qty = float(lote.get("Cantidad") or 0.0)
+                if lot_qty <= remaining + MIN_POSITION:
+                    moved = dict(lote)
+                    moved["Broker"] = dest_broker
+                    dst_lots.append(moved)
+                    remaining -= lot_qty
+                    lots_tr.pop(0)
+                else:
+                    frac = remaining / lot_qty
+                    moved = dict(lote)
+                    moved["Cantidad"] = remaining
+                    moved["Broker"] = dest_broker
+                    dst_lots.append(moved)
+                    lote["Cantidad"] = lot_qty - remaining
+                    remaining = 0.0
+            continue
+
         if broker is None or pd.isna(qty):
             continue
         qty_f = float(qty)
@@ -202,6 +261,10 @@ def compute_fifo_all(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.D
                     tax_eur = tax if tax_ccy == "EUR" else (tax * fx if fx and abs(fx) > 1e-9 else tax)
                     twc_full = total_base + comm_eur + tax_eur
                 pagado_cierre = float(twc_full) * cover_frac
+                # Cierre corto: misma convención que acciones (G/P = transmisión − adquisición).
+                valor_transmision = premio_cobrado
+                valor_adquisicion = pagado_cierre
+                plusvalia_cierre = valor_transmision - valor_adquisicion
                 sale_id = len(sales_rows)
                 isin_sale = _fifo_resolve_isin_row(row, key_ticker, ticker_orig, cat_cache)
                 dest_ret = _to_float(_safe_get(row, "destinationRetentionBaseCurrency"), 0.0)
@@ -222,9 +285,9 @@ def compute_fifo_all(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.D
                         "Cantidad venta (total)": cover,
                         "Cantidad (tramo)": cover,
                         "Fecha origen (lote)": lote.get("Fecha origen"),
-                        "Valor compra histórico (€)": premio_cobrado,
-                        "Valor venta (€)": pagado_cierre,
-                        "Plusvalía / Minusvalía (€)": premio_cobrado - pagado_cierre,
+                        "Valor compra histórico (€)": valor_adquisicion,
+                        "Valor venta (€)": valor_transmision,
+                        "Plusvalía / Minusvalía (€)": plusvalia_cierre,
                     }
                 )
                 sales_rows.append(
@@ -236,9 +299,9 @@ def compute_fifo_all(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.D
                         "Nombre": nombre,
                         "Fecha venta": fecha,
                         "Cantidad vendida": float(cover),
-                        "Valor compra histórico (€)": premio_cobrado,
-                        "Valor venta (€)": pagado_cierre,
-                        "Plusvalía / Minusvalía (€)": premio_cobrado - pagado_cierre,
+                        "Valor compra histórico (€)": valor_adquisicion,
+                        "Valor venta (€)": valor_transmision,
+                        "Plusvalía / Minusvalía (€)": plusvalia_cierre,
                         "Retención dest. (€)": dest_ret,
                         "Tipo activo": tipo_activo,
                         **_sale_ex,
