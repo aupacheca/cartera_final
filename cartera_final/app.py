@@ -66,7 +66,7 @@ from filios_core.isin import (
 )
 
 # Versión visible en PC y add-on. Al publicar el add-on, actualizar también cartera_final/config.yaml.
-APP_VERSION = "1.0.28"
+APP_VERSION = "1.0.29"
 
 
 _MADRID_TZ = ZoneInfo("Europe/Madrid")
@@ -1113,6 +1113,133 @@ def _row_to_db_val(v):
     if isinstance(v, (int, float)):
         return str(v).replace(".", CSV_DECIMAL)
     return str(v).strip()
+
+
+# Etiquetas CSV completo (vista en pantalla sigue usando el subconjunto reducido).
+_MOV_CSV_FULL_LABELS: dict[str, str] = {
+    "Tipo": "Tipo",
+    "origen": "Origen",
+    "datetime_full": "Fecha completa",
+    "_isin_disp": "ISIN (resuelto)",
+    "date": "Fecha",
+    "time": "Hora",
+    "ticker": "Ticker",
+    "ticker_Yahoo": "Ticker Yahoo",
+    "isin": "ISIN",
+    "name": "Posición / Nombre",
+    "positionType": "Tipo posición",
+    "positionCountry": "País",
+    "positionCurrency": "Divisa posición",
+    "positionExchange": "Bolsa / Exchange",
+    "broker": "Cuenta / Broker",
+    "type": "Tipo (código)",
+    "positionNumber": "Cantidad",
+    "price": "Precio",
+    "comission": "Comisión",
+    "comissionCurrency": "Divisa comisión",
+    "destinationRetentionBaseCurrency": "Retención en dest. realizada (€)",
+    "taxes": "Impuestos",
+    "taxesCurrency": "Divisa impuestos",
+    "exchangeRate": "Tipo de cambio",
+    "positionQuantity": "Position quantity",
+    "autoFx": "Auto FX",
+    "switchBuyPosition": "Switch buy position",
+    "switchBuyPositionType": "Switch buy type",
+    "switchBuyPositionNumber": "Switch buy number",
+    "switchBuyExchangeRate": "Switch buy FX",
+    "switchBuyBroker": "Switch buy broker",
+    "spinOffBuyPosition": "Spin-off hija (ISIN/ref)",
+    "spinOffBuyPositionNumber": "Spin-off títulos hija",
+    "spinOffBuyPositionAllocation": "Spin-off % coste hija",
+    "brokerTransferNewBroker": "Traspaso broker destino",
+    "total": "Total",
+    "totalBaseCurrency": "Total (€)",
+    "totalWithComission": "Total + com. + imp.",
+    "totalWithComissionBaseCurrency": "Total + com. + imp. (€)",
+    "positionCustomType": "Tipo personalizado (cripto)",
+    "description": "Observación",
+}
+
+
+def _build_movimientos_csv_completo(mov: pd.DataFrame) -> bytes:
+    """
+    Export CSV con todos los campos posibles de movimientos (BD + Tipo/Origen/ISIN vista).
+    Las celdas sin dato quedan vacías. No altera la tabla en pantalla.
+    """
+    preferred = [
+        "Tipo",
+        "origen",
+        "datetime_full",
+        "date",
+        "time",
+        "broker",
+        "name",
+        "ticker",
+        "ticker_Yahoo",
+        "isin",
+        "_isin_disp",
+        "positionType",
+        "positionCountry",
+        "positionCurrency",
+        "positionExchange",
+        "type",
+        "positionNumber",
+        "price",
+        "comission",
+        "comissionCurrency",
+        "taxes",
+        "taxesCurrency",
+        "exchangeRate",
+        "autoFx",
+        "total",
+        "totalBaseCurrency",
+        "totalWithComission",
+        "totalWithComissionBaseCurrency",
+        "destinationRetentionBaseCurrency",
+        "positionQuantity",
+        "switchBuyPosition",
+        "switchBuyPositionType",
+        "switchBuyPositionNumber",
+        "switchBuyExchangeRate",
+        "switchBuyBroker",
+        "spinOffBuyPosition",
+        "spinOffBuyPositionNumber",
+        "spinOffBuyPositionAllocation",
+        "brokerTransferNewBroker",
+        "positionCustomType",
+        "description",
+    ]
+    skip = {"_rowid_", "_acc_idx"}
+    all_db = list(dict.fromkeys(list(MOVIMIENTOS_COLUMNS) + list(MOVIMIENTOS_CRIPTOS_COLUMNS)))
+
+    if mov is None or mov.empty:
+        cols = [c for c in preferred if c not in skip]
+        out = pd.DataFrame(columns=[_MOV_CSV_FULL_LABELS.get(c, c) for c in cols])
+        return out.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig")
+
+    src = mov.copy()
+    # Asegurar columnas de esquema aunque vengan vacías / no existan en el filtro
+    for c in all_db:
+        if c not in src.columns:
+            src[c] = ""
+
+    ordered: list[str] = []
+    for c in preferred:
+        if c in skip:
+            continue
+        if c in src.columns or c in all_db:
+            ordered.append(c)
+    for c in src.columns:
+        if c in skip or c in ordered:
+            continue
+        if str(c).startswith("_") and c not in ("_isin_disp",):
+            continue
+        ordered.append(c)
+
+    export_df = src.reindex(columns=ordered)
+    export_df = export_df.rename(columns={c: _MOV_CSV_FULL_LABELS.get(c, c) for c in ordered})
+    export_df = export_df.fillna("")
+    return export_df.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig")
 
 
 def append_operation(new_row: dict) -> None:
@@ -8098,6 +8225,38 @@ def main() -> None:
                 st.dataframe(
                     _style_map(display_mov[cols_presentes].style, color_tipo, subset=["Tipo"]),
                     use_container_width=True,
+                )
+
+            # Export CSV: vista (como pantalla) vs completo (todos los campos BD, incl. Observación)
+            _exp_c1, _exp_c2, _exp_c3 = st.columns([1, 1, 2])
+            with _exp_c1:
+                st.download_button(
+                    "Descargar CSV (vista)",
+                    data=(
+                        display_mov[cols_presentes].to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig")
+                        if cols_presentes and not display_mov.empty
+                        else "".encode("utf-8-sig")
+                    ),
+                    file_name="movimientos_vista.csv",
+                    mime="text/csv",
+                    key="dl_mov_csv_vista",
+                    disabled=mov.empty,
+                    help="Mismas columnas que la tabla en pantalla.",
+                )
+            with _exp_c2:
+                st.download_button(
+                    "Descargar CSV completo",
+                    data=_build_movimientos_csv_completo(mov),
+                    file_name="movimientos_completo.csv",
+                    mime="text/csv",
+                    key="dl_mov_csv_full",
+                    disabled=mov.empty,
+                    help="Todos los campos de la base de datos (Observación, spin-off, divisas, etc.), aunque estén vacíos.",
+                )
+            with _exp_c3:
+                st.caption(
+                    "El CSV completo incluye **Observación** y el resto de campos internos; "
+                    "la tabla en pantalla no cambia."
                 )
 
             # Eliminar operaciones: tabla movimientos (acciones/ETFs/etc.) y movimientos_criptos
