@@ -988,6 +988,79 @@ def get_universe_instruments_table() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _identity_norm(val: str) -> str:
+    """Normaliza ticker / Yahoo / nombre para comparar unicidad (trim + casefold)."""
+    return (val or "").strip().casefold()
+
+
+def check_instrument_identity_available(
+    ticker: str,
+    ticker_yahoo: str,
+    name: str,
+    *,
+    exclude_yahoo: str | None = None,
+    crypto: bool = False,
+) -> tuple[bool, str]:
+    """
+    Comprueba que ticker, ticker_Yahoo y nombre no coincidan con los de otro instrumento.
+    Misma posición puede repetir ticker=nombre=Yahoo; no se permite reutilizar esos
+    campos en un instrumento distinto. exclude_yahoo ignora el instrumento al editar Catálogo.
+    """
+    t = (ticker or "").strip()
+    y_in = (ticker_yahoo or "").strip()
+    n = (name or "").strip()
+    if crypto:
+        y = _crypto_ticker_yahoo(t, y_in)
+    else:
+        y = y_in or t
+    n_eff = n or t
+    if not t and not y and not n_eff:
+        return True, ""
+
+    exclude_n = _identity_norm(exclude_yahoo or "")
+    prop_t = _identity_norm(t)
+    prop_y = _identity_norm(y)
+    prop_n = _identity_norm(n_eff)
+
+    try:
+        uni = get_universe_instruments_table()
+    except Exception:
+        uni = pd.DataFrame()
+
+    if uni is None or uni.empty:
+        return True, ""
+
+    for _, r in uni.iterrows():
+        oy = str(r.get("ticker_Yahoo") or "").strip()
+        if exclude_n and _identity_norm(oy) == exclude_n:
+            continue
+        ot = str(r.get("ticker") or "").strip()
+        on = str(r.get("name") or "").strip()
+        oy_n = _identity_norm(oy)
+        ot_n = _identity_norm(ot)
+        on_n = _identity_norm(on)
+
+        if prop_y and prop_y == oy_n:
+            return (
+                False,
+                f"Ya existe un instrumento con ticker Yahoo «{oy}». "
+                "Usa otro distintivo (p. ej. añade « #2»).",
+            )
+        if prop_t and prop_t == ot_n:
+            return (
+                False,
+                f"Ya existe un instrumento con ticker «{ot}». "
+                "Usa otro distintivo (p. ej. «SOFI Jul31'26 15 Put #2»).",
+            )
+        if prop_n and prop_n == on_n:
+            return (
+                False,
+                f"Ya existe un instrumento con nombre «{on}». "
+                "Elige otro nombre (p. ej. «BYD $» / «BYD (HKD)»).",
+            )
+    return True, ""
+
+
 def apply_global_instrument_update(
     old_yahoo: str,
     new_yahoo: str,
@@ -1011,6 +1084,16 @@ def apply_global_instrument_update(
         return False, "Selecciona un instrumento válido."
     if not new_yahoo:
         return False, "Ticker Yahoo no puede estar vacío."
+
+    ok_id, msg_id = check_instrument_identity_available(
+        ticker,
+        new_yahoo,
+        name,
+        exclude_yahoo=old_yahoo,
+        crypto=False,
+    )
+    if not ok_id:
+        return False, msg_id
 
     if new_yahoo != old_yahoo:
         with _get_db() as conn:
@@ -5989,6 +6072,10 @@ def main() -> None:
             )
             if sel != _CAT_PLACEHOLDER:
                 row = uni.loc[uni["ticker_Yahoo"] == sel].iloc[0]
+                st.caption(
+                    "Ticker, ticker Yahoo y nombre deben ser **únicos** respecto a otros instrumentos "
+                    "(mayúsculas/minúsculas no cuentan). En el mismo activo sí pueden coincidir entre sí."
+                )
                 c1, c2 = st.columns(2)
                 with c1:
                     ny = st.text_input("Ticker Yahoo", value=sel, key=f"cat_y_{sel}")
@@ -6184,7 +6271,12 @@ def main() -> None:
                                     ph_yh = "Mismo que ticker si no hay cotización Yahoo"
                                 position_yahoo = st.text_input("Ticker Yahoo", key="new_yahoo", placeholder=ph_yh)
                         with nc2:
-                            position_name = st.text_input("Nombre del activo", key="new_name", placeholder="Ej. Apple Inc.")
+                            position_name = st.text_input(
+                                "Nombre del activo",
+                                key="new_name",
+                                placeholder="Ej. Apple Inc. / SOFI Jul31'26 15 Put",
+                                help="Debe ser único frente a otros instrumentos. Si repites strike/fecha de opción, usa p. ej. «… #2».",
+                            )
                             position_currency = st.selectbox("Moneda", currencies_in_data, key="new_ccy")
                         with nc3:
                             if tipo_registro == "Fondos":
@@ -6410,70 +6502,82 @@ def main() -> None:
                                         ticker_d = str(rd.get("ticker") or rd.get("ticker_Yahoo") or "")
                                         name_d = str(rd.get("name") or ticker_d)
                                 if ticker_d:
-                                    ticker_o = str(ro.get("ticker") or ro.get("ticker_Yahoo") or "")
-                                    name_o = str(ro.get("name") or ticker_o)
-                                    yahoo_o = str(ro.get("ticker_Yahoo") or ticker_o).strip()
-                                    isin_o = _norm_isin_field(ro.get("isin")) or _lookup_isin_for_ticker_yahoo(yahoo_o) or ""
                                     if tf_destino == "➕ Nuevo fondo destino":
-                                        raw_d = (tf_destino_nuevo_ticker or "").strip()
-                                        isin_d = _norm_isin_field(raw_d) or _lookup_isin_for_ticker_yahoo(raw_d) or ""
-                                    else:
-                                        yahoo_d = str(rd.get("ticker_Yahoo") or ticker_d).strip()
-                                        isin_d = _norm_isin_field(rd.get("isin")) or _lookup_isin_for_ticker_yahoo(yahoo_d) or ""
-                                    if not isin_o or not isin_d:
-                                        st.error(
-                                            "El **ISIN** es obligatorio en traspasos entre fondos. "
-                                            "Complétalo en **Catálogo** o indica un ISIN/ticker válido en destino."
+                                        _ok_tf, _msg_tf = check_instrument_identity_available(
+                                            ticker_d,
+                                            ticker_d,
+                                            name_d or ticker_d,
                                         )
+                                        if not _ok_tf:
+                                            st.error(_msg_tf)
+                                            ticker_d = ""
+                                    if not ticker_d:
+                                        pass
                                     else:
-                                        qty_orig = _to_float(tf_qty, 0.0)
-                                        _raw_qty_dest = (tf_qty_dest or "").strip()
-                                        qty_dest = _to_float(tf_qty_dest, 0.0) if _raw_qty_dest else qty_orig
-                                        if _raw_qty_dest and qty_dest <= 0:
-                                            st.error("Las participaciones en destino deben ser mayores que cero.")
+                                        ticker_o = str(ro.get("ticker") or ro.get("ticker_Yahoo") or "")
+                                        name_o = str(ro.get("name") or ticker_o)
+                                        yahoo_o = str(ro.get("ticker_Yahoo") or ticker_o).strip()
+                                        isin_o = _norm_isin_field(ro.get("isin")) or _lookup_isin_for_ticker_yahoo(yahoo_o) or ""
+                                        if tf_destino == "➕ Nuevo fondo destino":
+                                            raw_d = (tf_destino_nuevo_ticker or "").strip()
+                                            isin_d = _norm_isin_field(raw_d) or _lookup_isin_for_ticker_yahoo(raw_d) or ""
                                         else:
-                                            valor_eur = _to_float(tf_valor_eur, 0.0)
-                                            date_str = tf_fecha.strftime("%Y-%m-%d") if hasattr(tf_fecha, "strftime") else str(tf_fecha)
-                                            time_str = tf_hora.strftime("%H:%M:%S") if hasattr(tf_hora, "strftime") else "12:00:00"
-                                            row_switch = {
-                                                "date": date_str, "time": time_str,
-                                                "ticker": ticker_o, "ticker_Yahoo": ro.get("ticker_Yahoo") or ticker_o, "isin": isin_o, "name": name_o,
-                                                "positionType": "fund", "positionCountry": "", "positionCurrency": "EUR", "positionExchange": "",
-                                                "broker": tf_broker, "type": "switch",
-                                                "positionNumber": qty_orig, "price": valor_eur / qty_orig if qty_orig else 0,
-                                                "comission": 0, "comissionCurrency": "EUR", "destinationRetentionBaseCurrency": "", "taxes": 0, "taxesCurrency": "EUR",
-                                                "exchangeRate": 1.0, "positionQuantity": "", "autoFx": "No",
-                                                "switchBuyPosition": ticker_d,
-                                                "switchBuyPositionType": "", "switchBuyPositionNumber": "", "switchBuyExchangeRate": "", "switchBuyBroker": "",
-                                                "spinOffBuyPosition": "", "spinOffBuyPositionNumber": "", "spinOffBuyPositionAllocation": "",
-                                                "brokerTransferNewBroker": "",
-                                                "total": valor_eur, "totalBaseCurrency": valor_eur, "totalWithComission": valor_eur, "totalWithComissionBaseCurrency": valor_eur,
-                                                "description": op_description,
-                                            }
-                                            yahoo_d_row = str(rd.get("ticker_Yahoo") or ticker_d).strip() if tf_destino != "➕ Nuevo fondo destino" else ticker_d
-                                            row_switchbuy = {
-                                                "date": date_str, "time": time_str,
-                                                "ticker": ticker_d, "ticker_Yahoo": yahoo_d_row, "isin": isin_d, "name": name_d,
-                                                "positionType": "fund", "positionCountry": "", "positionCurrency": "EUR", "positionExchange": "",
-                                                "broker": tf_broker, "type": "switchBuy",
-                                                "positionNumber": qty_dest, "price": valor_eur / qty_dest if qty_dest else 0,
-                                                "comission": 0, "comissionCurrency": "EUR", "destinationRetentionBaseCurrency": "", "taxes": 0, "taxesCurrency": "EUR",
-                                                "exchangeRate": 1.0, "positionQuantity": "", "autoFx": "No",
-                                                "switchBuyPosition": "", "switchBuyPositionType": "", "switchBuyPositionNumber": "", "switchBuyExchangeRate": "", "switchBuyBroker": "",
-                                                "spinOffBuyPosition": "", "spinOffBuyPositionNumber": "", "spinOffBuyPositionAllocation": "",
-                                                "brokerTransferNewBroker": "",
-                                                "total": valor_eur, "totalBaseCurrency": valor_eur, "totalWithComission": valor_eur, "totalWithComissionBaseCurrency": valor_eur,
-                                                "description": op_description,
-                                            }
-                                            try:
-                                                append_operation_fondos(row_switch)
-                                                append_operation_fondos(row_switchbuy)
-                                                load_data_fondos.clear()
-                                                _clear_form_nueva_operacion()
-                                                st.success("Traspaso entre fondos guardado.")
-                                                st.rerun()
-                                            except Exception as e:
-                                                st.error(f"Error al guardar: {e}")
+                                            yahoo_d = str(rd.get("ticker_Yahoo") or ticker_d).strip()
+                                            isin_d = _norm_isin_field(rd.get("isin")) or _lookup_isin_for_ticker_yahoo(yahoo_d) or ""
+                                        if not isin_o or not isin_d:
+                                            st.error(
+                                                "El **ISIN** es obligatorio en traspasos entre fondos. "
+                                                "Complétalo en **Catálogo** o indica un ISIN/ticker válido en destino."
+                                            )
+                                        else:
+                                            qty_orig = _to_float(tf_qty, 0.0)
+                                            _raw_qty_dest = (tf_qty_dest or "").strip()
+                                            qty_dest = _to_float(tf_qty_dest, 0.0) if _raw_qty_dest else qty_orig
+                                            if _raw_qty_dest and qty_dest <= 0:
+                                                st.error("Las participaciones en destino deben ser mayores que cero.")
+                                            else:
+                                                valor_eur = _to_float(tf_valor_eur, 0.0)
+                                                date_str = tf_fecha.strftime("%Y-%m-%d") if hasattr(tf_fecha, "strftime") else str(tf_fecha)
+                                                time_str = tf_hora.strftime("%H:%M:%S") if hasattr(tf_hora, "strftime") else "12:00:00"
+                                                row_switch = {
+                                                    "date": date_str, "time": time_str,
+                                                    "ticker": ticker_o, "ticker_Yahoo": ro.get("ticker_Yahoo") or ticker_o, "isin": isin_o, "name": name_o,
+                                                    "positionType": "fund", "positionCountry": "", "positionCurrency": "EUR", "positionExchange": "",
+                                                    "broker": tf_broker, "type": "switch",
+                                                    "positionNumber": qty_orig, "price": valor_eur / qty_orig if qty_orig else 0,
+                                                    "comission": 0, "comissionCurrency": "EUR", "destinationRetentionBaseCurrency": "", "taxes": 0, "taxesCurrency": "EUR",
+                                                    "exchangeRate": 1.0, "positionQuantity": "", "autoFx": "No",
+                                                    "switchBuyPosition": ticker_d,
+                                                    "switchBuyPositionType": "", "switchBuyPositionNumber": "", "switchBuyExchangeRate": "", "switchBuyBroker": "",
+                                                    "spinOffBuyPosition": "", "spinOffBuyPositionNumber": "", "spinOffBuyPositionAllocation": "",
+                                                    "brokerTransferNewBroker": "",
+                                                    "total": valor_eur, "totalBaseCurrency": valor_eur, "totalWithComission": valor_eur, "totalWithComissionBaseCurrency": valor_eur,
+                                                    "description": op_description,
+                                                }
+                                                yahoo_d_row = str(rd.get("ticker_Yahoo") or ticker_d).strip() if tf_destino != "➕ Nuevo fondo destino" else ticker_d
+                                                row_switchbuy = {
+                                                    "date": date_str, "time": time_str,
+                                                    "ticker": ticker_d, "ticker_Yahoo": yahoo_d_row, "isin": isin_d, "name": name_d,
+                                                    "positionType": "fund", "positionCountry": "", "positionCurrency": "EUR", "positionExchange": "",
+                                                    "broker": tf_broker, "type": "switchBuy",
+                                                    "positionNumber": qty_dest, "price": valor_eur / qty_dest if qty_dest else 0,
+                                                    "comission": 0, "comissionCurrency": "EUR", "destinationRetentionBaseCurrency": "", "taxes": 0, "taxesCurrency": "EUR",
+                                                    "exchangeRate": 1.0, "positionQuantity": "", "autoFx": "No",
+                                                    "switchBuyPosition": "", "switchBuyPositionType": "", "switchBuyPositionNumber": "", "switchBuyExchangeRate": "", "switchBuyBroker": "",
+                                                    "spinOffBuyPosition": "", "spinOffBuyPositionNumber": "", "spinOffBuyPositionAllocation": "",
+                                                    "brokerTransferNewBroker": "",
+                                                    "total": valor_eur, "totalBaseCurrency": valor_eur, "totalWithComission": valor_eur, "totalWithComissionBaseCurrency": valor_eur,
+                                                    "description": op_description,
+                                                }
+                                                try:
+                                                    append_operation_fondos(row_switch)
+                                                    append_operation_fondos(row_switchbuy)
+                                                    load_data_fondos.clear()
+                                                    _clear_form_nueva_operacion()
+                                                    st.success("Traspaso entre fondos guardado.")
+                                                    st.rerun()
+                                                except Exception as e:
+                                                    st.error(f"Error al guardar: {e}")
                 # --- Formulario específico: Transferencia entre brokers (solo Acciones/ETFs) ---
                 elif tipo_registro in ("Acciones/ETFs", "Otros") and op_type == "brokerTransfer":
                     st.caption("Transfiere títulos de una cuenta (broker) a otra. El coste se arrastra, no hay tributo.")
@@ -6676,57 +6780,69 @@ def main() -> None:
                                         ticker_d = str(rd.get("ticker") or rd.get("ticker_Yahoo") or "")
                                         name_d = str(rd.get("name") or ticker_d)
                                 if ticker_d:
-                                    ticker_o = str(ro.get("ticker") or ro.get("ticker_Yahoo") or "")
-                                    name_o = str(ro.get("name") or ticker_o)
-                                    ticker_yahoo_o = _crypto_ticker_yahoo(ticker_o, ro.get("ticker_Yahoo") or "")
+                                    _skip_perm = False
                                     if perm_destino == "➕ Nueva cripto destino":
-                                        ticker_yahoo_d = _crypto_ticker_yahoo(ticker_d, "")
-                                    else:
-                                        rd = catalog_criptos.iloc[cripto_dest_options.index(perm_destino) - 2]
-                                        ticker_yahoo_d = _crypto_ticker_yahoo(ticker_d, rd.get("ticker_Yahoo") or "")
-                                    qty_o = _to_float(perm_qty_origen, 0.0)
-                                    qty_d = _to_float(perm_qty_destino, 0.0)
-                                    valor_eur = _to_float(perm_valor_eur, 0.0)
-                                    date_str = perm_fecha.strftime("%Y-%m-%d") if hasattr(perm_fecha, "strftime") else str(perm_fecha)
-                                    time_str = perm_hora.strftime("%H:%M:%S") if hasattr(perm_hora, "strftime") else "12:00:00"
-                                    row_switch = {
-                                        "date": date_str, "time": time_str,
-                                        "ticker": ticker_o, "ticker_Yahoo": ticker_yahoo_o, "name": name_o,
-                                        "positionType": "crypto", "positionCountry": "", "positionCurrency": "EUR", "positionExchange": "",
-                                        "broker": perm_broker, "type": "switch",
-                                        "positionNumber": qty_o, "price": valor_eur / qty_o if qty_o else 0,
-                                        "comission": 0, "comissionCurrency": "EUR", "destinationRetentionBaseCurrency": "", "taxes": 0, "taxesCurrency": "EUR",
-                                        "exchangeRate": 1.0, "positionQuantity": "", "autoFx": "No",
-                                        "switchBuyPosition": ticker_d,
-                                        "switchBuyPositionType": "", "switchBuyPositionNumber": "", "switchBuyExchangeRate": "", "switchBuyBroker": "",
-                                        "spinOffBuyPosition": "", "spinOffBuyPositionNumber": "", "spinOffBuyPositionAllocation": "",
-                                        "brokerTransferNewBroker": "",
-                                        "total": valor_eur, "totalBaseCurrency": valor_eur, "totalWithComission": valor_eur, "totalWithComissionBaseCurrency": valor_eur,
-                                        "positionCustomType": "", "description": op_description,
-                                    }
-                                    row_switchbuy = {
-                                        "date": date_str, "time": time_str,
-                                        "ticker": ticker_d, "ticker_Yahoo": ticker_yahoo_d, "name": name_d,
-                                        "positionType": "crypto", "positionCountry": "", "positionCurrency": "EUR", "positionExchange": "",
-                                        "broker": perm_broker, "type": "switchBuy",
-                                        "positionNumber": qty_d, "price": valor_eur / qty_d if qty_d else 0,
-                                        "comission": 0, "comissionCurrency": "EUR", "destinationRetentionBaseCurrency": "", "taxes": 0, "taxesCurrency": "EUR",
-                                        "exchangeRate": 1.0, "positionQuantity": "", "autoFx": "No",
-                                        "switchBuyPosition": "", "switchBuyPositionType": "", "switchBuyPositionNumber": "", "switchBuyExchangeRate": "", "switchBuyBroker": "",
-                                        "spinOffBuyPosition": "", "spinOffBuyPositionNumber": "", "spinOffBuyPositionAllocation": "",
-                                        "brokerTransferNewBroker": "",
-                                        "total": valor_eur, "totalBaseCurrency": valor_eur, "totalWithComission": valor_eur, "totalWithComissionBaseCurrency": valor_eur,
-                                        "positionCustomType": "", "description": op_description,
-                                    }
-                                    try:
-                                        append_operation_criptos(row_switch)
-                                        append_operation_criptos(row_switchbuy)
-                                        load_data_criptos.clear()
-                                        _clear_form_nueva_operacion()
-                                        st.success("Permuta guardada (switch + switchBuy en Criptos).")
-                                        st.rerun()
-                                    except Exception as e:
-                                        st.error(f"Error al guardar: {e}")
+                                        _ok_perm, _msg_perm = check_instrument_identity_available(
+                                            ticker_d,
+                                            "",
+                                            name_d or ticker_d,
+                                            crypto=True,
+                                        )
+                                        if not _ok_perm:
+                                            st.error(_msg_perm)
+                                            _skip_perm = True
+                                    if not _skip_perm:
+                                        ticker_o = str(ro.get("ticker") or ro.get("ticker_Yahoo") or "")
+                                        name_o = str(ro.get("name") or ticker_o)
+                                        ticker_yahoo_o = _crypto_ticker_yahoo(ticker_o, ro.get("ticker_Yahoo") or "")
+                                        if perm_destino == "➕ Nueva cripto destino":
+                                            ticker_yahoo_d = _crypto_ticker_yahoo(ticker_d, "")
+                                        else:
+                                            rd = catalog_criptos.iloc[cripto_dest_options.index(perm_destino) - 2]
+                                            ticker_yahoo_d = _crypto_ticker_yahoo(ticker_d, rd.get("ticker_Yahoo") or "")
+                                        qty_o = _to_float(perm_qty_origen, 0.0)
+                                        qty_d = _to_float(perm_qty_destino, 0.0)
+                                        valor_eur = _to_float(perm_valor_eur, 0.0)
+                                        date_str = perm_fecha.strftime("%Y-%m-%d") if hasattr(perm_fecha, "strftime") else str(perm_fecha)
+                                        time_str = perm_hora.strftime("%H:%M:%S") if hasattr(perm_hora, "strftime") else "12:00:00"
+                                        row_switch = {
+                                            "date": date_str, "time": time_str,
+                                            "ticker": ticker_o, "ticker_Yahoo": ticker_yahoo_o, "name": name_o,
+                                            "positionType": "crypto", "positionCountry": "", "positionCurrency": "EUR", "positionExchange": "",
+                                            "broker": perm_broker, "type": "switch",
+                                            "positionNumber": qty_o, "price": valor_eur / qty_o if qty_o else 0,
+                                            "comission": 0, "comissionCurrency": "EUR", "destinationRetentionBaseCurrency": "", "taxes": 0, "taxesCurrency": "EUR",
+                                            "exchangeRate": 1.0, "positionQuantity": "", "autoFx": "No",
+                                            "switchBuyPosition": ticker_d,
+                                            "switchBuyPositionType": "", "switchBuyPositionNumber": "", "switchBuyExchangeRate": "", "switchBuyBroker": "",
+                                            "spinOffBuyPosition": "", "spinOffBuyPositionNumber": "", "spinOffBuyPositionAllocation": "",
+                                            "brokerTransferNewBroker": "",
+                                            "total": valor_eur, "totalBaseCurrency": valor_eur, "totalWithComission": valor_eur, "totalWithComissionBaseCurrency": valor_eur,
+                                            "positionCustomType": "", "description": op_description,
+                                        }
+                                        row_switchbuy = {
+                                            "date": date_str, "time": time_str,
+                                            "ticker": ticker_d, "ticker_Yahoo": ticker_yahoo_d, "name": name_d,
+                                            "positionType": "crypto", "positionCountry": "", "positionCurrency": "EUR", "positionExchange": "",
+                                            "broker": perm_broker, "type": "switchBuy",
+                                            "positionNumber": qty_d, "price": valor_eur / qty_d if qty_d else 0,
+                                            "comission": 0, "comissionCurrency": "EUR", "destinationRetentionBaseCurrency": "", "taxes": 0, "taxesCurrency": "EUR",
+                                            "exchangeRate": 1.0, "positionQuantity": "", "autoFx": "No",
+                                            "switchBuyPosition": "", "switchBuyPositionType": "", "switchBuyPositionNumber": "", "switchBuyExchangeRate": "", "switchBuyBroker": "",
+                                            "spinOffBuyPosition": "", "spinOffBuyPositionNumber": "", "spinOffBuyPositionAllocation": "",
+                                            "brokerTransferNewBroker": "",
+                                            "total": valor_eur, "totalBaseCurrency": valor_eur, "totalWithComission": valor_eur, "totalWithComissionBaseCurrency": valor_eur,
+                                            "positionCustomType": "", "description": op_description,
+                                        }
+                                        try:
+                                            append_operation_criptos(row_switch)
+                                            append_operation_criptos(row_switchbuy)
+                                            load_data_criptos.clear()
+                                            _clear_form_nueva_operacion()
+                                            st.success("Permuta guardada (switch + switchBuy en Criptos).")
+                                            st.rerun()
+                                        except Exception as e:
+                                            st.error(f"Error al guardar: {e}")
                 else:
                     _is_acc_split = op_type == "split" and tipo_registro in ("Acciones/ETFs", "Otros")
                     _is_acc_spinoff = op_type == "spinoff" and tipo_registro == "Acciones/ETFs"
@@ -7310,76 +7426,86 @@ def main() -> None:
                                     elif not _child_ref:
                                         st.error("Indica ticker/ticker Yahoo de la posición hija.")
                                     else:
-                                        if hasattr(op_time, "strftime"):
-                                            time_str = op_time.strftime("%H:%M:%S")
+                                        _ok_sp, _msg_sp = (True, "")
+                                        if sp_dest_mode == "Crear nueva":
+                                            _ok_sp, _msg_sp = check_instrument_identity_available(
+                                                sp_child_ticker or "",
+                                                sp_child_yahoo or "",
+                                                sp_child_name or "",
+                                            )
+                                        if not _ok_sp:
+                                            st.error(_msg_sp)
                                         else:
-                                            _t = str(op_time).strip() if op_time else "00:00:00"
-                                            if ":" in _t:
-                                                parts = _t.split(":")
-                                                time_str = f"{parts[0].zfill(2)}:{parts[1].zfill(2)}:00" if len(parts) == 2 else f"{parts[0].zfill(2)}:{parts[1].zfill(2)}:{str(parts[2]).zfill(2)}"
+                                            if hasattr(op_time, "strftime"):
+                                                time_str = op_time.strftime("%H:%M:%S")
                                             else:
-                                                time_str = _t or "00:00:00"
-                                        date_str = op_date.strftime("%Y-%m-%d") if hasattr(op_date, "strftime") else str(op_date)
-                                        new_row_spinoff = {
-                                            "date": date_str,
-                                            "time": time_str,
-                                            "ticker": position_ticker or position_yahoo,
-                                            "ticker_Yahoo": position_yahoo or position_ticker,
-                                            "isin": _iso_parent,
-                                            "name": position_name or position_ticker,
-                                            "positionType": position_type,
-                                            "positionCountry": position_country or "",
-                                            "positionCurrency": position_currency,
-                                            "positionExchange": position_exchange or "",
-                                            "broker": op_broker,
-                                            "type": "spinoff",
-                                            "positionNumber": op_quantity,
-                                            "price": 0.0,
-                                            "comission": 0.0,
-                                            "comissionCurrency": op_commission_ccy,
-                                            "destinationRetentionBaseCurrency": "",
-                                            "taxes": 0.0,
-                                            "taxesCurrency": op_taxes_ccy,
-                                            "exchangeRate": 1.0,
-                                            "positionQuantity": "",
-                                            "autoFx": "No",
-                                            "switchBuyPosition": _child_ref,
-                                            "switchBuyPositionType": sp_child_name,
-                                            "switchBuyPositionNumber": "",
-                                            "switchBuyExchangeRate": "",
-                                            "switchBuyBroker": "",
-                                            "spinOffBuyPosition": _iso_child,
-                                            "spinOffBuyPositionNumber": sp_qty_recv,
-                                            "spinOffBuyPositionAllocation": sp_alloc_pct,
-                                            "brokerTransferNewBroker": "",
-                                            "total": 0.0,
-                                            "totalBaseCurrency": 0.0,
-                                            "totalWithComission": 0.0,
-                                            "totalWithComissionBaseCurrency": 0.0,
-                                            "description": op_description,
-                                        }
-                                        try:
-                                            append_operation(new_row_spinoff)
-                                            load_data.clear()
-                                            if _child_ref and _iso_child:
-                                                _init_instrument_catalog()
-                                                with _get_db() as conn:
-                                                    conn.execute(
-                                                        "DELETE FROM instrument_catalog WHERE ticker_Yahoo = ?",
-                                                        (_child_ref,),
-                                                    )
-                                                    conn.execute(
-                                                        "INSERT INTO instrument_catalog (ticker_Yahoo, isin) VALUES (?, ?)",
-                                                        (_child_ref, _iso_child),
-                                                    )
-                                                    conn.commit()
-                                            if "nuevo_form_abierto" in st.session_state:
-                                                st.session_state["nuevo_form_abierto"] = False
-                                            _clear_form_nueva_operacion()
-                                            st.success("Spin-off registrado.")
-                                            st.rerun()
-                                        except Exception as e:
-                                            st.error(f"Error al guardar: {e}")
+                                                _t = str(op_time).strip() if op_time else "00:00:00"
+                                                if ":" in _t:
+                                                    parts = _t.split(":")
+                                                    time_str = f"{parts[0].zfill(2)}:{parts[1].zfill(2)}:00" if len(parts) == 2 else f"{parts[0].zfill(2)}:{parts[1].zfill(2)}:{str(parts[2]).zfill(2)}"
+                                                else:
+                                                    time_str = _t or "00:00:00"
+                                            date_str = op_date.strftime("%Y-%m-%d") if hasattr(op_date, "strftime") else str(op_date)
+                                            new_row_spinoff = {
+                                                "date": date_str,
+                                                "time": time_str,
+                                                "ticker": position_ticker or position_yahoo,
+                                                "ticker_Yahoo": position_yahoo or position_ticker,
+                                                "isin": _iso_parent,
+                                                "name": position_name or position_ticker,
+                                                "positionType": position_type,
+                                                "positionCountry": position_country or "",
+                                                "positionCurrency": position_currency,
+                                                "positionExchange": position_exchange or "",
+                                                "broker": op_broker,
+                                                "type": "spinoff",
+                                                "positionNumber": op_quantity,
+                                                "price": 0.0,
+                                                "comission": 0.0,
+                                                "comissionCurrency": op_commission_ccy,
+                                                "destinationRetentionBaseCurrency": "",
+                                                "taxes": 0.0,
+                                                "taxesCurrency": op_taxes_ccy,
+                                                "exchangeRate": 1.0,
+                                                "positionQuantity": "",
+                                                "autoFx": "No",
+                                                "switchBuyPosition": _child_ref,
+                                                "switchBuyPositionType": sp_child_name,
+                                                "switchBuyPositionNumber": "",
+                                                "switchBuyExchangeRate": "",
+                                                "switchBuyBroker": "",
+                                                "spinOffBuyPosition": _iso_child,
+                                                "spinOffBuyPositionNumber": sp_qty_recv,
+                                                "spinOffBuyPositionAllocation": sp_alloc_pct,
+                                                "brokerTransferNewBroker": "",
+                                                "total": 0.0,
+                                                "totalBaseCurrency": 0.0,
+                                                "totalWithComission": 0.0,
+                                                "totalWithComissionBaseCurrency": 0.0,
+                                                "description": op_description,
+                                            }
+                                            try:
+                                                append_operation(new_row_spinoff)
+                                                load_data.clear()
+                                                if _child_ref and _iso_child:
+                                                    _init_instrument_catalog()
+                                                    with _get_db() as conn:
+                                                        conn.execute(
+                                                            "DELETE FROM instrument_catalog WHERE ticker_Yahoo = ?",
+                                                            (_child_ref,),
+                                                        )
+                                                        conn.execute(
+                                                            "INSERT INTO instrument_catalog (ticker_Yahoo, isin) VALUES (?, ?)",
+                                                            (_child_ref, _iso_child),
+                                                        )
+                                                        conn.commit()
+                                                if "nuevo_form_abierto" in st.session_state:
+                                                    st.session_state["nuevo_form_abierto"] = False
+                                                _clear_form_nueva_operacion()
+                                                st.success("Spin-off registrado.")
+                                                st.rerun()
+                                            except Exception as e:
+                                                st.error(f"Error al guardar: {e}")
                         elif _is_acc_split:
                             if es_posicion_nueva:
                                 st.error(
@@ -7483,83 +7609,93 @@ def main() -> None:
                                         "Indícalo en el formulario (posición nueva) o complétalo en **Catálogo**."
                                     )
                                 else:
-                                    total_base = op_total_local * (op_exchange_rate if op_exchange_rate and abs(op_exchange_rate) > 1e-9 else 1.0)
-                                    if hasattr(op_time, "strftime"):
-                                        time_str = op_time.strftime("%H:%M:%S")
+                                    _ok_pa, _msg_pa = (True, "")
+                                    if es_posicion_nueva:
+                                        _ok_pa, _msg_pa = check_instrument_identity_available(
+                                            position_ticker or "",
+                                            position_yahoo or "",
+                                            position_name or "",
+                                        )
+                                    if not _ok_pa:
+                                        st.error(_msg_pa)
                                     else:
-                                        _t = str(op_time).strip() if op_time else "00:00:00"
-                                        if ":" in _t:
-                                            parts = _t.split(":")
-                                            time_str = f"{parts[0].zfill(2)}:{parts[1].zfill(2)}:00" if len(parts) == 2 else f"{parts[0].zfill(2)}:{parts[1].zfill(2)}:{str(parts[2]).zfill(2)}"
+                                        total_base = op_total_local * (op_exchange_rate if op_exchange_rate and abs(op_exchange_rate) > 1e-9 else 1.0)
+                                        if hasattr(op_time, "strftime"):
+                                            time_str = op_time.strftime("%H:%M:%S")
                                         else:
-                                            time_str = _t or "00:00:00"
-                                    date_str = op_date.strftime("%Y-%m-%d") if hasattr(op_date, "strftime") else str(op_date)
-                                    new_row_assign = {
-                                        "date": date_str,
-                                        "time": time_str,
-                                        "ticker": position_ticker or position_yahoo,
-                                        "ticker_Yahoo": position_yahoo or position_ticker,
-                                        "isin": iso_final,
-                                        "name": position_name or position_ticker,
-                                        "positionType": position_type,
-                                        "positionCountry": position_country or "",
-                                        "positionCurrency": position_currency,
-                                        "positionExchange": position_exchange or "",
-                                        "broker": op_broker,
-                                        "type": "buy",
-                                        "positionNumber": op_quantity,
-                                        "price": op_price,
-                                        "comission": 0.0,
-                                        "comissionCurrency": op_commission_ccy,
-                                        "destinationRetentionBaseCurrency": "",
-                                        "taxes": 0.0,
-                                        "taxesCurrency": op_taxes_ccy,
-                                        "exchangeRate": op_exchange_rate,
-                                        "positionQuantity": "",
-                                        "autoFx": "No",
-                                        "switchBuyPosition": "",
-                                        "switchBuyPositionType": "",
-                                        "switchBuyPositionNumber": "",
-                                        "switchBuyExchangeRate": "",
-                                        "switchBuyBroker": "",
-                                        "spinOffBuyPosition": "",
-                                        "spinOffBuyPositionNumber": "",
-                                        "spinOffBuyPositionAllocation": "",
-                                        "brokerTransferNewBroker": "",
-                                        "total": op_total_local,
-                                        "totalBaseCurrency": total_base,
-                                        "totalWithComission": op_total_local,
-                                        "totalWithComissionBaseCurrency": total_base,
-                                        "description": (
-                                            f"[PUT asignada] {pa_option_ref}"
-                                            + (f" | {op_description}" if op_description else "")
-                                        ).strip(" |")
-                                        if pa_option_ref
-                                        else op_description,
-                                    }
-                                    try:
-                                        append_operation(new_row_assign)
-                                        load_data.clear()
-                                        yk = (position_yahoo or position_ticker or "").strip()
-                                        if yk and iso_final:
-                                            _init_instrument_catalog()
-                                            with _get_db() as conn:
-                                                conn.execute(
-                                                    "DELETE FROM instrument_catalog WHERE ticker_Yahoo = ?",
-                                                    (yk,),
-                                                )
-                                                conn.execute(
-                                                    "INSERT INTO instrument_catalog (ticker_Yahoo, isin) VALUES (?, ?)",
-                                                    (yk, iso_final),
-                                                )
-                                                conn.commit()
-                                        if "nuevo_form_abierto" in st.session_state:
-                                            st.session_state["nuevo_form_abierto"] = False
-                                        _clear_form_nueva_operacion()
-                                        st.success("Asignación de put registrada como compra neta (sin doble cómputo de prima).")
-                                        st.rerun()
-                                    except Exception as e:
-                                        st.error(f"Error al guardar: {e}")
+                                            _t = str(op_time).strip() if op_time else "00:00:00"
+                                            if ":" in _t:
+                                                parts = _t.split(":")
+                                                time_str = f"{parts[0].zfill(2)}:{parts[1].zfill(2)}:00" if len(parts) == 2 else f"{parts[0].zfill(2)}:{parts[1].zfill(2)}:{str(parts[2]).zfill(2)}"
+                                            else:
+                                                time_str = _t or "00:00:00"
+                                        date_str = op_date.strftime("%Y-%m-%d") if hasattr(op_date, "strftime") else str(op_date)
+                                        new_row_assign = {
+                                            "date": date_str,
+                                            "time": time_str,
+                                            "ticker": position_ticker or position_yahoo,
+                                            "ticker_Yahoo": position_yahoo or position_ticker,
+                                            "isin": iso_final,
+                                            "name": position_name or position_ticker,
+                                            "positionType": position_type,
+                                            "positionCountry": position_country or "",
+                                            "positionCurrency": position_currency,
+                                            "positionExchange": position_exchange or "",
+                                            "broker": op_broker,
+                                            "type": "buy",
+                                            "positionNumber": op_quantity,
+                                            "price": op_price,
+                                            "comission": 0.0,
+                                            "comissionCurrency": op_commission_ccy,
+                                            "destinationRetentionBaseCurrency": "",
+                                            "taxes": 0.0,
+                                            "taxesCurrency": op_taxes_ccy,
+                                            "exchangeRate": op_exchange_rate,
+                                            "positionQuantity": "",
+                                            "autoFx": "No",
+                                            "switchBuyPosition": "",
+                                            "switchBuyPositionType": "",
+                                            "switchBuyPositionNumber": "",
+                                            "switchBuyExchangeRate": "",
+                                            "switchBuyBroker": "",
+                                            "spinOffBuyPosition": "",
+                                            "spinOffBuyPositionNumber": "",
+                                            "spinOffBuyPositionAllocation": "",
+                                            "brokerTransferNewBroker": "",
+                                            "total": op_total_local,
+                                            "totalBaseCurrency": total_base,
+                                            "totalWithComission": op_total_local,
+                                            "totalWithComissionBaseCurrency": total_base,
+                                            "description": (
+                                                f"[PUT asignada] {pa_option_ref}"
+                                                + (f" | {op_description}" if op_description else "")
+                                            ).strip(" |")
+                                            if pa_option_ref
+                                            else op_description,
+                                        }
+                                        try:
+                                            append_operation(new_row_assign)
+                                            load_data.clear()
+                                            yk = (position_yahoo or position_ticker or "").strip()
+                                            if yk and iso_final:
+                                                _init_instrument_catalog()
+                                                with _get_db() as conn:
+                                                    conn.execute(
+                                                        "DELETE FROM instrument_catalog WHERE ticker_Yahoo = ?",
+                                                        (yk,),
+                                                    )
+                                                    conn.execute(
+                                                        "INSERT INTO instrument_catalog (ticker_Yahoo, isin) VALUES (?, ?)",
+                                                        (yk, iso_final),
+                                                    )
+                                                    conn.commit()
+                                            if "nuevo_form_abierto" in st.session_state:
+                                                st.session_state["nuevo_form_abierto"] = False
+                                            _clear_form_nueva_operacion()
+                                            st.success("Asignación de put registrada como compra neta (sin doble cómputo de prima).")
+                                            st.rerun()
+                                        except Exception as e:
+                                            st.error(f"Error al guardar: {e}")
                         elif _is_acc_call_assignment:
                             if op_quantity <= 0:
                                 st.error("Indica títulos vendidos mayores que 0.")
@@ -7581,84 +7717,94 @@ def main() -> None:
                                         "Indícalo en el formulario (posición nueva) o complétalo en **Catálogo**."
                                     )
                                 else:
-                                    rec = _recalc_totals(
-                                        float(op_quantity or 0),
-                                        float(op_price or 0),
-                                        float(op_commission or 0),
-                                        0.0,
-                                        float(op_exchange_rate or 1.0),
-                                        str(position_currency or "EUR"),
-                                        str(op_commission_ccy or ""),
-                                        str(op_taxes_ccy or ""),
-                                        tipo="sell",
-                                    )
-                                    total_local = rec["total"]
-                                    total_base = rec["totalBaseCurrency"]
-                                    total_with_comm_local = rec["totalWithComission"]
-                                    total_with_comm_base = rec["totalWithComissionBaseCurrency"]
-                                    if hasattr(op_time, "strftime"):
-                                        time_str = op_time.strftime("%H:%M:%S")
+                                    _ok_ca, _msg_ca = (True, "")
+                                    if es_posicion_nueva:
+                                        _ok_ca, _msg_ca = check_instrument_identity_available(
+                                            position_ticker or "",
+                                            position_yahoo or "",
+                                            position_name or "",
+                                        )
+                                    if not _ok_ca:
+                                        st.error(_msg_ca)
                                     else:
-                                        _t = str(op_time).strip() if op_time else "00:00:00"
-                                        if ":" in _t:
-                                            parts = _t.split(":")
-                                            time_str = f"{parts[0].zfill(2)}:{parts[1].zfill(2)}:00" if len(parts) == 2 else f"{parts[0].zfill(2)}:{parts[1].zfill(2)}:{str(parts[2]).zfill(2)}"
+                                        rec = _recalc_totals(
+                                            float(op_quantity or 0),
+                                            float(op_price or 0),
+                                            float(op_commission or 0),
+                                            0.0,
+                                            float(op_exchange_rate or 1.0),
+                                            str(position_currency or "EUR"),
+                                            str(op_commission_ccy or ""),
+                                            str(op_taxes_ccy or ""),
+                                            tipo="sell",
+                                        )
+                                        total_local = rec["total"]
+                                        total_base = rec["totalBaseCurrency"]
+                                        total_with_comm_local = rec["totalWithComission"]
+                                        total_with_comm_base = rec["totalWithComissionBaseCurrency"]
+                                        if hasattr(op_time, "strftime"):
+                                            time_str = op_time.strftime("%H:%M:%S")
                                         else:
-                                            time_str = _t or "00:00:00"
-                                    date_str = op_date.strftime("%Y-%m-%d") if hasattr(op_date, "strftime") else str(op_date)
-                                    new_row_call_assign = {
-                                        "date": date_str,
-                                        "time": time_str,
-                                        "ticker": position_ticker or position_yahoo,
-                                        "ticker_Yahoo": position_yahoo or position_ticker,
-                                        "isin": iso_final,
-                                        "name": position_name or position_ticker,
-                                        "positionType": position_type,
-                                        "positionCountry": position_country or "",
-                                        "positionCurrency": position_currency,
-                                        "positionExchange": position_exchange or "",
-                                        "broker": op_broker,
-                                        "type": "sell",
-                                        "positionNumber": op_quantity,
-                                        "price": op_price,
-                                        "comission": op_commission,
-                                        "comissionCurrency": op_commission_ccy,
-                                        "destinationRetentionBaseCurrency": "",
-                                        "taxes": 0.0,
-                                        "taxesCurrency": op_taxes_ccy,
-                                        "exchangeRate": op_exchange_rate,
-                                        "positionQuantity": "",
-                                        "autoFx": "No",
-                                        "switchBuyPosition": "",
-                                        "switchBuyPositionType": "",
-                                        "switchBuyPositionNumber": "",
-                                        "switchBuyExchangeRate": "",
-                                        "switchBuyBroker": "",
-                                        "spinOffBuyPosition": "",
-                                        "spinOffBuyPositionNumber": "",
-                                        "spinOffBuyPositionAllocation": "",
-                                        "brokerTransferNewBroker": "",
-                                        "total": total_local,
-                                        "totalBaseCurrency": total_base,
-                                        "totalWithComission": total_with_comm_local,
-                                        "totalWithComissionBaseCurrency": total_with_comm_base,
-                                        "description": (
-                                            f"[CALL ejercida] {ca_option_ref}"
-                                            + (f" | {op_description}" if op_description else "")
-                                        ).strip(" |")
-                                        if ca_option_ref
-                                        else op_description,
-                                    }
-                                    try:
-                                        append_operation(new_row_call_assign)
-                                        load_data.clear()
-                                        if "nuevo_form_abierto" in st.session_state:
-                                            st.session_state["nuevo_form_abierto"] = False
-                                        _clear_form_nueva_operacion()
-                                        st.success("Ejercicio/asignación de call registrado como venta neta (sin doble cómputo de prima).")
-                                        st.rerun()
-                                    except Exception as e:
-                                        st.error(f"Error al guardar: {e}")
+                                            _t = str(op_time).strip() if op_time else "00:00:00"
+                                            if ":" in _t:
+                                                parts = _t.split(":")
+                                                time_str = f"{parts[0].zfill(2)}:{parts[1].zfill(2)}:00" if len(parts) == 2 else f"{parts[0].zfill(2)}:{parts[1].zfill(2)}:{str(parts[2]).zfill(2)}"
+                                            else:
+                                                time_str = _t or "00:00:00"
+                                        date_str = op_date.strftime("%Y-%m-%d") if hasattr(op_date, "strftime") else str(op_date)
+                                        new_row_call_assign = {
+                                            "date": date_str,
+                                            "time": time_str,
+                                            "ticker": position_ticker or position_yahoo,
+                                            "ticker_Yahoo": position_yahoo or position_ticker,
+                                            "isin": iso_final,
+                                            "name": position_name or position_ticker,
+                                            "positionType": position_type,
+                                            "positionCountry": position_country or "",
+                                            "positionCurrency": position_currency,
+                                            "positionExchange": position_exchange or "",
+                                            "broker": op_broker,
+                                            "type": "sell",
+                                            "positionNumber": op_quantity,
+                                            "price": op_price,
+                                            "comission": op_commission,
+                                            "comissionCurrency": op_commission_ccy,
+                                            "destinationRetentionBaseCurrency": "",
+                                            "taxes": 0.0,
+                                            "taxesCurrency": op_taxes_ccy,
+                                            "exchangeRate": op_exchange_rate,
+                                            "positionQuantity": "",
+                                            "autoFx": "No",
+                                            "switchBuyPosition": "",
+                                            "switchBuyPositionType": "",
+                                            "switchBuyPositionNumber": "",
+                                            "switchBuyExchangeRate": "",
+                                            "switchBuyBroker": "",
+                                            "spinOffBuyPosition": "",
+                                            "spinOffBuyPositionNumber": "",
+                                            "spinOffBuyPositionAllocation": "",
+                                            "brokerTransferNewBroker": "",
+                                            "total": total_local,
+                                            "totalBaseCurrency": total_base,
+                                            "totalWithComission": total_with_comm_local,
+                                            "totalWithComissionBaseCurrency": total_with_comm_base,
+                                            "description": (
+                                                f"[CALL ejercida] {ca_option_ref}"
+                                                + (f" | {op_description}" if op_description else "")
+                                            ).strip(" |")
+                                            if ca_option_ref
+                                            else op_description,
+                                        }
+                                        try:
+                                            append_operation(new_row_call_assign)
+                                            load_data.clear()
+                                            if "nuevo_form_abierto" in st.session_state:
+                                                st.session_state["nuevo_form_abierto"] = False
+                                            _clear_form_nueva_operacion()
+                                            st.success("Ejercicio/asignación de call registrado como venta neta (sin doble cómputo de prima).")
+                                            st.rerun()
+                                        except Exception as e:
+                                            st.error(f"Error al guardar: {e}")
                         elif not es_posicion_nueva and (not sel_pos or sel_pos == "—— Elige posición ——"):
                             st.error("Elige una posición de la lista.")
                         elif es_posicion_nueva and (not (position_ticker or position_yahoo)):
@@ -7680,112 +7826,124 @@ def main() -> None:
                                     "Indícalo en el formulario (posición nueva) o complétalo en **Catálogo** (posición existente)."
                                 )
                             else:
-                                if precio_o_total == "Total":
-                                    total_local = op_total_local
-                                    op_price = (op_total_local / op_quantity) if op_quantity else 0.0
+                                _ok_id, _msg_id = (True, "")
+                                if es_posicion_nueva:
+                                    _ok_id, _msg_id = check_instrument_identity_available(
+                                        position_ticker or "",
+                                        position_yahoo or "",
+                                        position_name or "",
+                                        crypto=tipo_registro == "Criptos"
+                                        or str(position_type or "").strip().lower() == "crypto",
+                                    )
+                                if not _ok_id:
+                                    st.error(_msg_id)
                                 else:
-                                    total_local = op_quantity * op_price if op_quantity else 0.0
-                                recalc = _recalc_totals(
-                                    float(op_quantity or 0),
-                                    float(op_price or 0),
-                                    float(op_commission or 0),
-                                    float(op_taxes or 0),
-                                    float(op_exchange_rate or 1.0),
-                                    str(position_currency or "EUR"),
-                                    str(op_commission_ccy or ""),
-                                    str(op_taxes_ccy or ""),
-                                    tipo=str(op_type or ""),
-                                )
-                                total_local = recalc["total"]
-                                total_base = recalc["totalBaseCurrency"]
-                                total_with_comm_local = recalc["totalWithComission"]
-                                total_with_comm_base = recalc["totalWithComissionBaseCurrency"]
-
-                                if hasattr(op_time, "strftime"):
-                                    time_str = op_time.strftime("%H:%M:%S")
-                                else:
-                                    _t = str(op_time).strip() if op_time else "00:00:00"
-                                    if ":" in _t:
-                                        parts = _t.split(":")
-                                        time_str = f"{parts[0].zfill(2)}:{parts[1].zfill(2)}:00" if len(parts) == 2 else f"{parts[0].zfill(2)}:{parts[1].zfill(2)}:{str(parts[2]).zfill(2)}"
+                                    if precio_o_total == "Total":
+                                        total_local = op_total_local
+                                        op_price = (op_total_local / op_quantity) if op_quantity else 0.0
                                     else:
-                                        time_str = _t or "00:00:00"
-                                date_str = op_date.strftime("%Y-%m-%d") if hasattr(op_date, "strftime") else str(op_date)
+                                        total_local = op_quantity * op_price if op_quantity else 0.0
+                                    recalc = _recalc_totals(
+                                        float(op_quantity or 0),
+                                        float(op_price or 0),
+                                        float(op_commission or 0),
+                                        float(op_taxes or 0),
+                                        float(op_exchange_rate or 1.0),
+                                        str(position_currency or "EUR"),
+                                        str(op_commission_ccy or ""),
+                                        str(op_taxes_ccy or ""),
+                                        tipo=str(op_type or ""),
+                                    )
+                                    total_local = recalc["total"]
+                                    total_base = recalc["totalBaseCurrency"]
+                                    total_with_comm_local = recalc["totalWithComission"]
+                                    total_with_comm_base = recalc["totalWithComissionBaseCurrency"]
 
-                                new_row = {
-                                    "date": date_str,
-                                    "time": time_str,
-                                    "ticker": position_ticker or position_yahoo,
-                                    "ticker_Yahoo": position_yahoo or position_ticker,
-                                    "isin": iso_final,
-                                    "name": position_name or position_ticker,
-                                    "positionType": position_type,
-                                    "positionCountry": position_country or "",
-                                    "positionCurrency": position_currency,
-                                    "positionExchange": position_exchange or "",
-                                    "broker": op_broker,
-                                    "type": op_type,
-                                    "positionNumber": op_quantity,
-                                    "price": op_price,
-                                    "comission": op_commission,
-                                    "comissionCurrency": op_commission_ccy,
-                                    "destinationRetentionBaseCurrency": op_dest_ret if op_dest_ret else "",
-                                    "taxes": op_taxes,
-                                    "taxesCurrency": op_taxes_ccy,
-                                    "exchangeRate": op_exchange_rate,
-                                    "positionQuantity": "",
-                                    "autoFx": "Yes" if auto_fx else "No",
-                                    "switchBuyPosition": "",
-                                    "switchBuyPositionType": "",
-                                    "switchBuyPositionNumber": "",
-                                    "switchBuyExchangeRate": "",
-                                    "switchBuyBroker": "",
-                                    "spinOffBuyPosition": "",
-                                    "spinOffBuyPositionNumber": "",
-                                    "spinOffBuyPositionAllocation": "",
-                                    "brokerTransferNewBroker": "",
-                                    "total": total_local,
-                                    "totalBaseCurrency": total_base,
-                                    "totalWithComission": total_with_comm_local,
-                                    "totalWithComissionBaseCurrency": total_with_comm_base,
-                                    "description": op_description,
-                                }
-                                try:
-                                    if position_type == "fund":
-                                        append_operation_fondos(new_row)
-                                        load_data_fondos.clear()
-                                    elif position_type == "crypto":
-                                        row_crip = {c: new_row.get(c, "") for c in MOVIMIENTOS_COLUMNS}
-                                        row_crip["positionType"] = "crypto"
-                                        row_crip["positionCustomType"] = ""
-                                        row_crip["description"] = op_description
-                                        yahoo_arg = "" if es_posicion_nueva else row_crip.get("ticker_Yahoo", "")
-                                        row_crip["ticker_Yahoo"] = _crypto_ticker_yahoo(row_crip.get("ticker", ""), yahoo_arg)
-                                        append_operation_criptos(row_crip)
-                                        load_data_criptos.clear()
+                                    if hasattr(op_time, "strftime"):
+                                        time_str = op_time.strftime("%H:%M:%S")
                                     else:
-                                        append_operation(new_row)
-                                        load_data.clear()
-                                    yk = (position_yahoo or position_ticker or "").strip()
-                                    if yk and iso_final:
-                                        _init_instrument_catalog()
-                                        with _get_db() as conn:
-                                            conn.execute(
-                                                "DELETE FROM instrument_catalog WHERE ticker_Yahoo = ?",
-                                                (yk,),
-                                            )
-                                            conn.execute(
-                                                "INSERT INTO instrument_catalog (ticker_Yahoo, isin) VALUES (?, ?)",
-                                                (yk, iso_final),
-                                            )
-                                            conn.commit()
-                                    if "nuevo_form_abierto" in st.session_state:
-                                        st.session_state["nuevo_form_abierto"] = False
-                                    _clear_form_nueva_operacion()
-                                    st.success("Operación guardada.")
-                                    st.rerun()
-                                except Exception as e:
-                                    st.error(f"Error al guardar: {e}")
+                                        _t = str(op_time).strip() if op_time else "00:00:00"
+                                        if ":" in _t:
+                                            parts = _t.split(":")
+                                            time_str = f"{parts[0].zfill(2)}:{parts[1].zfill(2)}:00" if len(parts) == 2 else f"{parts[0].zfill(2)}:{parts[1].zfill(2)}:{str(parts[2]).zfill(2)}"
+                                        else:
+                                            time_str = _t or "00:00:00"
+                                    date_str = op_date.strftime("%Y-%m-%d") if hasattr(op_date, "strftime") else str(op_date)
+
+                                    new_row = {
+                                        "date": date_str,
+                                        "time": time_str,
+                                        "ticker": position_ticker or position_yahoo,
+                                        "ticker_Yahoo": position_yahoo or position_ticker,
+                                        "isin": iso_final,
+                                        "name": position_name or position_ticker,
+                                        "positionType": position_type,
+                                        "positionCountry": position_country or "",
+                                        "positionCurrency": position_currency,
+                                        "positionExchange": position_exchange or "",
+                                        "broker": op_broker,
+                                        "type": op_type,
+                                        "positionNumber": op_quantity,
+                                        "price": op_price,
+                                        "comission": op_commission,
+                                        "comissionCurrency": op_commission_ccy,
+                                        "destinationRetentionBaseCurrency": op_dest_ret if op_dest_ret else "",
+                                        "taxes": op_taxes,
+                                        "taxesCurrency": op_taxes_ccy,
+                                        "exchangeRate": op_exchange_rate,
+                                        "positionQuantity": "",
+                                        "autoFx": "Yes" if auto_fx else "No",
+                                        "switchBuyPosition": "",
+                                        "switchBuyPositionType": "",
+                                        "switchBuyPositionNumber": "",
+                                        "switchBuyExchangeRate": "",
+                                        "switchBuyBroker": "",
+                                        "spinOffBuyPosition": "",
+                                        "spinOffBuyPositionNumber": "",
+                                        "spinOffBuyPositionAllocation": "",
+                                        "brokerTransferNewBroker": "",
+                                        "total": total_local,
+                                        "totalBaseCurrency": total_base,
+                                        "totalWithComission": total_with_comm_local,
+                                        "totalWithComissionBaseCurrency": total_with_comm_base,
+                                        "description": op_description,
+                                    }
+                                    try:
+                                        if position_type == "fund":
+                                            append_operation_fondos(new_row)
+                                            load_data_fondos.clear()
+                                        elif position_type == "crypto":
+                                            row_crip = {c: new_row.get(c, "") for c in MOVIMIENTOS_COLUMNS}
+                                            row_crip["positionType"] = "crypto"
+                                            row_crip["positionCustomType"] = ""
+                                            row_crip["description"] = op_description
+                                            yahoo_arg = "" if es_posicion_nueva else row_crip.get("ticker_Yahoo", "")
+                                            row_crip["ticker_Yahoo"] = _crypto_ticker_yahoo(row_crip.get("ticker", ""), yahoo_arg)
+                                            append_operation_criptos(row_crip)
+                                            load_data_criptos.clear()
+                                        else:
+                                            append_operation(new_row)
+                                            load_data.clear()
+                                        yk = (position_yahoo or position_ticker or "").strip()
+                                        if yk and iso_final:
+                                            _init_instrument_catalog()
+                                            with _get_db() as conn:
+                                                conn.execute(
+                                                    "DELETE FROM instrument_catalog WHERE ticker_Yahoo = ?",
+                                                    (yk,),
+                                                )
+                                                conn.execute(
+                                                    "INSERT INTO instrument_catalog (ticker_Yahoo, isin) VALUES (?, ?)",
+                                                    (yk, iso_final),
+                                                )
+                                                conn.commit()
+                                        if "nuevo_form_abierto" in st.session_state:
+                                            st.session_state["nuevo_form_abierto"] = False
+                                        _clear_form_nueva_operacion()
+                                        st.success("Operación guardada.")
+                                        st.rerun()
+                                    except Exception as e:
+                                        st.error(f"Error al guardar: {e}")
 
             df_fondos_mov = load_data_fondos()
             mov_acc = df.copy()
