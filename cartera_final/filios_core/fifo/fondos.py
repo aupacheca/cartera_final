@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import pandas as pd
 
+from filios_core.fifo.chrono import sort_movimientos_fifo_chrono
 from filios_core.fifo.keys import _fifo_fondo_pending_dest_fiscal, _fifo_queue_key_fondos
 from filios_core.fifo.sale_extras import fifo_sale_amount_cols
 from filios_core.isin import _fifo_resolve_isin_row
@@ -16,7 +17,7 @@ def compute_positions_fondos(df: pd.DataFrame) -> list[dict]:
     Posiciones de fondos con traspasos fiscales españoles (coste arrastrado).
     df debe venir ordenado por load_data_fondos. Devuelve lista de dicts con broker, ticker, nombre, cantidad, coste_total_eur.
     """
-    data = df.copy()
+    data = sort_movimientos_fifo_chrono(df, kind="fondos")
     lots_by_key: dict[tuple[str, str], list[dict]] = {}
     pending_traspasos: list[dict] = []
 
@@ -176,7 +177,7 @@ def compute_fifo_fondos(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, p
 
     Con ISIN conocido (movimiento o catálogo), un único saco FIFO por ISIN.
     """
-    data = df.copy()
+    data = sort_movimientos_fifo_chrono(df, kind="fondos")
     cat_cache: dict[str, str] = {}
     lots_by_key: dict[tuple, list[dict]] = {}
     pending_traspasos: list[dict] = []

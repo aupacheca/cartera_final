@@ -4,6 +4,7 @@ from __future__ import annotations
 import pandas as pd
 
 from filios_core.constants import MIN_POSITION
+from filios_core.fifo.chrono import sort_movimientos_fifo_chrono
 from filios_core.fifo.keys import _fifo_queue_key_stocks, _fifo_split_affected_keys_stocks
 from filios_core.fifo.sale_extras import fifo_sale_amount_cols
 from filios_core.isin import _fifo_resolve_isin_row
@@ -18,17 +19,14 @@ def compute_fifo_all(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.D
     Si el instrumento tiene ISIN (movimiento o instrument_catalog), el FIFO es **global por ISIN**
     (mismo saco aunque el listing o el broker difieran). Sin ISIN, se mantiene FIFO por (broker, ticker Yahoo).
 
+    A igual fecha/hora: entradas antes que salidas, luego `_rowid_` (orden estable; no escribe en BD).
+
     Devuelve:
       - lots_df: lotes vivos (cada lote conserva Broker/Nombre originales)
       - sales_df: ventas con coste histórico y plusvalía/minusvalía
       - sales_detail_df: una fila por cada tramo FIFO consumido en cada venta/permuta
     """
-    if "datetime_full" in df.columns:
-        data = df.sort_values("datetime_full").copy()
-    elif "date" in df.columns:
-        data = df.sort_values("date").copy()
-    else:
-        data = df.copy()
+    data = sort_movimientos_fifo_chrono(df, kind="stocks")
 
     cat_cache: dict[str, str] = {}
     lots_by_key: dict[tuple, list[dict]] = {}
