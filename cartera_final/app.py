@@ -51,6 +51,7 @@ from filios_core.fifo import (
     compute_positions_criptos,
     compute_positions_fondos,
 )
+from filios_core.fifo.chrono import sort_movimientos_fifo_chrono
 from filios_core.util import safe_get as _safe_get, to_float as _to_float
 from filios_core.isin import (
     _catalog_origen_requires_isin,
@@ -66,7 +67,8 @@ from filios_core.isin import (
 )
 
 # Versión visible en PC y add-on. Al publicar el add-on, actualizar también cartera_final/config.yaml.
-APP_VERSION = "1.0.29"
+APP_VERSION = "1.0.31"
+
 
 
 _MADRID_TZ = ZoneInfo("Europe/Madrid")
@@ -776,9 +778,7 @@ def load_data_fondos() -> pd.DataFrame:
         df["datetime_full"] = pd.to_datetime(dt_str, format="mixed", errors="coerce")
     else:
         df["datetime_full"] = pd.Series(pd.RangeIndex(len(df)), index=df.index)
-    _order = df["type"].astype(str).str.strip().str.lower().map({"switch": 0, "switchbuy": 1})
-    df["_type_order"] = _order.fillna(2)
-    df = df.reset_index().sort_values(["datetime_full", "_type_order", "index"]).drop(columns=["index", "_type_order"], errors="ignore").reset_index(drop=True)
+    df = sort_movimientos_fifo_chrono(df, kind="fondos")
     for col in ["positionNumber", "price", "totalWithComissionBaseCurrency", "totalBaseCurrency", "total", "exchangeRate", "comission", "taxes"]:
         if col in df.columns:
             s = df[col].astype(str).str.strip().str.replace(",", ".", regex=False)
@@ -1708,7 +1708,7 @@ def load_data() -> pd.DataFrame:
     else:
         df["datetime_full"] = pd.Series(pd.RangeIndex(len(df)), index=df.index)
 
-    df = df.sort_values("datetime_full").reset_index(drop=True)
+    df = sort_movimientos_fifo_chrono(df, kind="stocks")
 
     numeric_cols = [
         "positionNumber", "price", "totalWithComissionBaseCurrency",
@@ -2158,6 +2158,7 @@ def compute_positions_fifo(df: pd.DataFrame) -> pd.DataFrame:
     - Para instrumentos sin ISIN, se mantiene la cola por (broker, ticker Yahoo).
     - El display agrupa los lotes vivos por (Broker, Ticker_Yahoo, Divisa).
     """
+    df = sort_movimientos_fifo_chrono(df, kind="stocks")
     queues: dict[tuple, list[dict]] = {}
     cat_cache: dict[str, str] = {}
 
