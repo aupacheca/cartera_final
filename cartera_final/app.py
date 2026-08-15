@@ -67,7 +67,7 @@ from filios_core.isin import (
 )
 
 # Versión visible en PC y add-on. Al publicar el add-on, actualizar también cartera_final/config.yaml.
-APP_VERSION = "1.0.31"
+APP_VERSION = "1.0.32"
 
 
 
@@ -9394,7 +9394,7 @@ def main() -> None:
         total_bruto_extranjero = bruto_div_extranjero_con_ret_origen + p2p_cobrado_con_ret_extranjero
         total_retencion_extranjero = impuesto_ext_imputable_div + p2p_retencion_extranjero_sum
 
-        # Comisiones: de movimientos y dividendos del ejercicio
+        # Comisiones: solo movimientos del ejercicio (acciones/fondos/cripto). Dividendos se tratan aparte.
         df_all = df.copy()
         if not df_fondos_fisc.empty:
             df_all = pd.concat([df_all, df_fondos_fisc], ignore_index=True)
@@ -9402,11 +9402,11 @@ def main() -> None:
             df_all = pd.concat([df_all, df_crip_fisc], ignore_index=True)
         df_all["year"] = pd.to_datetime(df_all["date"], errors="coerce").dt.year
         df_ejercicio = df_all[df_all["year"] == ejercicio] if "year" in df_all.columns else df_all
-        comisiones_mov = df_ejercicio["comission"].apply(lambda x: _to_float_div(x, 0.0)).sum() if not df_ejercicio.empty and "comission" in df_ejercicio.columns else 0.0
-        comisiones_div = div_ejercicio["comission"].apply(lambda x: _to_float_div(x, 0.0)).sum() if not div_ejercicio.empty and "comission" in div_ejercicio.columns else 0.0
-        if not div_ejercicio.empty and "comissionBaseCurrency" in div_ejercicio.columns:
-            comisiones_div = div_ejercicio["comissionBaseCurrency"].apply(lambda x: _to_float_div(x, 0.0)).sum()
-        total_comisiones = comisiones_mov + comisiones_div
+        total_comisiones = (
+            df_ejercicio["comission"].apply(lambda x: _to_float_div(x, 0.0)).sum()
+            if not df_ejercicio.empty and "comission" in df_ejercicio.columns
+            else 0.0
+        )
 
         impuesto_ext_no_rec_div = max(0.0, retencion_origen_efectiva_div - impuesto_ext_imputable_div)
 
@@ -9436,7 +9436,7 @@ def main() -> None:
             st.metric(
                 "Comisiones (€)",
                 fmt_eur(total_comisiones),
-                help="Comisiones de movimientos del ejercicio (acciones, fondos, cripto) más comisiones ligadas a dividendos del ejercicio.",
+                help="Suma de comisiones registradas en movimientos del ejercicio (acciones, fondos, cripto). No incluye comisiones de dividendos.",
             )
         with col2:
             _ar, _ap = _FISC_ACCENT_RENTA, _FISC_ACCENT_P2P
