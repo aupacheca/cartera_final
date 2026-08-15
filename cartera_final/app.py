@@ -67,7 +67,7 @@ from filios_core.isin import (
 )
 
 # Versión visible en PC y add-on. Al publicar el add-on, actualizar también cartera_final/config.yaml.
-APP_VERSION = "1.0.32"
+APP_VERSION = "1.0.33"
 
 
 
@@ -2683,6 +2683,52 @@ def get_fx_rate_for_date(currency: str, as_of_date) -> float:
     except Exception:
         pass
     return math.nan
+
+
+def _movement_comission_eur(row, *, to_float=_to_float) -> float:
+    """
+    Comisión del movimiento en EUR (gasto positivo).
+    - Si la comisión ya es EUR: se usa tal cual.
+    - Si coincide con la divisa de la posición: comission × exchangeRate del movimiento
+      (tipo del día usado al registrar, normalmente BCE).
+    - Si es otra fiat: tipo BCE/Yahoo de la fecha del movimiento.
+    - Si es cripto (BTC, …): intenta cotización *-EUR de esa fecha; si falla, 0.
+    """
+    comm = abs(to_float(row.get("comission"), 0.0))
+    if comm < 1e-15:
+        return 0.0
+    ccy = str(row.get("comissionCurrency") or "").strip().upper()
+    if not ccy or ccy == "EUR":
+        return comm
+    pos_ccy = str(row.get("positionCurrency") or "").strip().upper()
+    fx = to_float(row.get("exchangeRate"), 0.0)
+    fiat = {c.upper() for c in POSITION_FORM_CURRENCIES}
+    if ccy == pos_ccy and fx and abs(fx) > 1e-12:
+        return comm * fx
+    if ccy in fiat:
+        if fx and abs(fx) > 1e-12 and (not pos_ccy or ccy == pos_ccy):
+            return comm * fx
+        dt = row.get("date")
+        rate = get_fx_rate_for_date(ccy, dt)
+        if not math.isnan(rate) and rate > 0:
+            return comm * rate
+        if fx and abs(fx) > 1e-12:
+            return comm * fx
+        return 0.0
+    # Comisión pagada en cripto u otro activo
+    dt = row.get("date")
+    try:
+        start = pd.Timestamp(dt)
+        end = start + pd.Timedelta(days=3)
+        for pair in (f"{ccy}-EUR", f"{ccy}EUR=X"):
+            hist = yf.Ticker(pair).history(start=start, end=end)
+            if not hist.empty and "Close" in hist.columns:
+                px = float(hist["Close"].iloc[0])
+                if px > 0:
+                    return comm * px
+    except Exception:
+        pass
+    return 0.0
 
 
 @st.cache_data(ttl=1800)
@@ -9394,19 +9440,25 @@ def main() -> None:
         total_bruto_extranjero = bruto_div_extranjero_con_ret_origen + p2p_cobrado_con_ret_extranjero
         total_retencion_extranjero = impuesto_ext_imputable_div + p2p_retencion_extranjero_sum
 
-        # Comisiones: solo movimientos del ejercicio (acciones/fondos/cripto). Dividendos se tratan aparte.
+        # Comisiones en EUR: movimientos del ejercicio (sin dividendos). Conversión por tipo del movimiento.
         df_all = df.copy()
         if not df_fondos_fisc.empty:
             df_all = pd.concat([df_all, df_fondos_fisc], ignore_index=True)
         if not df_crip_fisc.empty:
             df_all = pd.concat([df_all, df_crip_fisc], ignore_index=True)
-        df_all["year"] = pd.to_datetime(df_all["date"], errors="coerce").dt.year
+        if "datetime_full" in df_all.columns:
+            df_all["year"] = pd.to_datetime(df_all["datetime_full"], errors="coerce").dt.year
+        else:
+            # Fechas ISO (YYYY-MM-DD): no usar dayfirst (rompe el año).
+            _ds = df_all["date"].astype(str).str.strip().str.slice(0, 10)
+            df_all["year"] = pd.to_datetime(_ds, format="%Y-%m-%d", errors="coerce").dt.year
         df_ejercicio = df_all[df_all["year"] == ejercicio] if "year" in df_all.columns else df_all
-        total_comisiones = (
-            df_ejercicio["comission"].apply(lambda x: _to_float_div(x, 0.0)).sum()
-            if not df_ejercicio.empty and "comission" in df_ejercicio.columns
-            else 0.0
-        )
+        if df_ejercicio.empty:
+            total_comisiones = 0.0
+        else:
+            total_comisiones = float(
+                df_ejercicio.apply(lambda r: _movement_comission_eur(r, to_float=_to_float_div), axis=1).sum()
+            )
 
         impuesto_ext_no_rec_div = max(0.0, retencion_origen_efectiva_div - impuesto_ext_imputable_div)
 
@@ -9436,7 +9488,8 @@ def main() -> None:
             st.metric(
                 "Comisiones (€)",
                 fmt_eur(total_comisiones),
-                help="Suma de comisiones registradas en movimientos del ejercicio (acciones, fondos, cripto). No incluye comisiones de dividendos.",
+                help="Comisiones de movimientos del ejercicio convertidas a EUR (tipo del movimiento / BCE del día). "
+                "Sin comisiones de dividendos.",
             )
         with col2:
             _ar, _ap = _FISC_ACCENT_RENTA, _FISC_ACCENT_P2P
