@@ -67,7 +67,7 @@ from filios_core.isin import (
 )
 
 # Versión visible en PC y add-on. Al publicar el add-on, actualizar también cartera_final/config.yaml.
-APP_VERSION = "1.0.33"
+APP_VERSION = "1.0.34"
 
 
 
@@ -543,6 +543,55 @@ def load_intereses_extranjero() -> pd.DataFrame:
     if "retencion_destino_eur" not in df.columns:
         df["retencion_destino_eur"] = 0.0
     return df
+
+
+def _years_from_date_series(series: pd.Series | None) -> set[int]:
+    """Años naturales válidos de una columna de fechas (ISO o datetime)."""
+    if series is None:
+        return set()
+    s = pd.to_datetime(series, errors="coerce")
+    years = s.dt.year.dropna()
+    out: set[int] = set()
+    for y in years.unique():
+        yi = int(y)
+        if 1990 <= yi <= 2100:
+            out.add(yi)
+    return out
+
+
+def fiscal_ejercicio_year_options(
+    df_acc: pd.DataFrame | None,
+    df_fondos: pd.DataFrame | None,
+    df_crip: pd.DataFrame | None,
+    df_div: pd.DataFrame | None,
+    df_ie: pd.DataFrame | None,
+) -> list[int]:
+    """
+    Años del selector de Fiscalidad: solo ejercicios con movimientos, dividendos
+    o intereses extranjero. Si no hay datos, el año calendario actual.
+    """
+    years: set[int] = set()
+
+    def _from_mov(frame: pd.DataFrame | None) -> None:
+        if frame is None or frame.empty:
+            return
+        if "datetime_full" in frame.columns:
+            years.update(_years_from_date_series(frame["datetime_full"]))
+        elif "date" in frame.columns:
+            years.update(_years_from_date_series(frame["date"]))
+
+    _from_mov(df_acc)
+    _from_mov(df_fondos)
+    _from_mov(df_crip)
+    _from_mov(df_div)
+    if df_ie is not None and not df_ie.empty and "ejercicio" in df_ie.columns:
+        for y in pd.to_numeric(df_ie["ejercicio"], errors="coerce").dropna().unique():
+            yi = int(y)
+            if 1990 <= yi <= 2100:
+                years.add(yi)
+    if not years:
+        years.add(datetime.now().year)
+    return sorted(years, reverse=True)
 
 
 def append_interes_extranjero(
@@ -9297,25 +9346,32 @@ def main() -> None:
             except (ValueError, TypeError):
                 return default
 
-        # --- Selector de ejercicio (año natural; ventas/tramos por «Fecha venta») ---
+        # --- Selector de ejercicio: solo años con datos (movimientos, dividendos, P2P) ---
+        df_fondos_fisc = load_data_fondos()
+        df_crip_fisc = load_data_criptos()
         anio_actual = datetime.now().year
-        _ej_opts = list(range(anio_actual + 1, anio_actual - 16, -1))
-        _ej_def = _ej_opts.index(anio_actual) if anio_actual in _ej_opts else min(1, len(_ej_opts) - 1)
+        _ej_opts = fiscal_ejercicio_year_options(
+            df, df_fondos_fisc, df_crip_fisc, load_dividendos(), load_intereses_extranjero()
+        )
+        if "fisc_ejercicio_year" in st.session_state and st.session_state["fisc_ejercicio_year"] not in _ej_opts:
+            del st.session_state["fisc_ejercicio_year"]
+        if anio_actual in _ej_opts:
+            _ej_def = _ej_opts.index(anio_actual)
+        else:
+            _ej_def = 0
         ejercicio = st.selectbox(
             "Ejercicio fiscal",
             options=_ej_opts,
             index=_ej_def,
-            help="Resumen fiscal, G/P, dividendos, comisiones, ventas y tramos FIFO se filtran por este año (fecha de venta o de cobro). "
-            "Posiciones vivas = cartera actual (sin cortar por año).",
+            help="Solo aparecen años con movimientos, dividendos o intereses extranjero. "
+            "Resumen fiscal, G/P, dividendos, comisiones, ventas y tramos FIFO se filtran por este año "
+            "(fecha de venta o de cobro). Posiciones vivas = cartera actual (sin cortar por año).",
             key="fisc_ejercicio_year",
         )
         st.caption(
-            f"El selector **arranca en {anio_actual}**. Si ves la venta en Movimientos pero no aquí, comprueba que el año sea el de la **fecha de venta** (p. ej. 2025)."
+            "El listado **crece con tus operaciones**. Si ves la venta en Movimientos pero no aquí, "
+            "comprueba que el año sea el de la **fecha de venta** (p. ej. 2025)."
         )
-
-        # --- Cargar datos FIFO ---
-        df_fondos_fisc = load_data_fondos()
-        df_crip_fisc = load_data_criptos()
 
         lots_df, sales_df, sales_detail_acc = compute_fifo_all(df)
         sales_acc_para_regla_2m = sales_df.copy()
