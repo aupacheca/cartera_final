@@ -67,7 +67,7 @@ from filios_core.isin import (
 )
 
 # Versión visible en PC y add-on. Al publicar el add-on, actualizar también cartera_final/config.yaml.
-APP_VERSION = "1.0.34"
+APP_VERSION = "1.0.35"
 
 
 
@@ -958,6 +958,50 @@ def get_ticker_catalog(df: pd.DataFrame) -> pd.DataFrame:
         base = pd.concat([base, pd.DataFrame(extra_rows)], ignore_index=True)
 
     return base.drop_duplicates(subset=["ticker_Yahoo"], keep="first").sort_values("ticker_Yahoo").reset_index(drop=True)
+
+
+def catalog_opciones_abiertas_ordenadas(catalog: pd.DataFrame, pos_acc: pd.DataFrame) -> pd.DataFrame:
+    """
+    Opciones put/call del catálogo con posición viva (pendientes de cierre).
+    Orden alfabético por ticker y nombre (lo que se ve en el selectbox).
+    """
+    req = ["ticker_Yahoo", "ticker", "name", "positionCurrency", "positionExchange", "positionCountry", "positionType"]
+    if catalog is None or catalog.empty or "positionType" not in catalog.columns:
+        return pd.DataFrame(columns=req)
+    pt_cat = catalog["positionType"].astype(str).str.strip().str.lower()
+    opts = catalog[pt_cat.isin(["putoption", "calloption"])].copy()
+    if opts.empty:
+        return opts
+
+    open_keys: set[str] = set()
+    if pos_acc is not None and not pos_acc.empty and "Ticker_Yahoo" in pos_acc.columns and "Titulos" in pos_acc.columns:
+        # Cruce por Yahoo/ticker con el catálogo de opciones (acciones abiertas no coinciden).
+        for _, pr in pos_acc.iterrows():
+            try:
+                qty = abs(float(pr.get("Titulos") or 0.0))
+            except (TypeError, ValueError):
+                qty = 0.0
+            if qty <= MIN_POSITION:
+                continue
+            for k in (pr.get("Ticker_Yahoo"), pr.get("Ticker")):
+                s = str(k or "").strip()
+                if s:
+                    open_keys.add(s)
+
+    if not open_keys:
+        return opts.iloc[0:0].copy()
+
+    yh = opts["ticker_Yahoo"].astype(str).str.strip()
+    tk = opts["ticker"].astype(str).str.strip()
+    opts = opts[yh.isin(open_keys) | tk.isin(open_keys)].copy()
+    if opts.empty:
+        return opts
+
+    opts = opts.assign(
+        _sort_t=opts["ticker"].astype(str).str.casefold(),
+        _sort_n=opts["name"].astype(str).str.casefold(),
+    ).sort_values(["_sort_t", "_sort_n"], kind="mergesort")
+    return opts.drop(columns=["_sort_t", "_sort_n"]).reset_index(drop=True)
 
 
 def get_ticker_catalog_criptos(df: pd.DataFrame) -> pd.DataFrame:
@@ -6268,12 +6312,8 @@ def main() -> None:
                     position_type = "stock" if tipo_nuevo == "Acción" else "etf"
                 elif tipo_registro == "Opciones (Put/Call)":
                     position_type_base = "putOption"
-                    catalog_activo = catalog
-                    if catalog is not None and not catalog.empty and "positionType" in catalog.columns:
-                        pt_cat = catalog["positionType"].astype(str).str.strip().str.lower()
-                        catalog_activo = catalog[pt_cat.isin(["putoption", "calloption"])].copy()
-                    else:
-                        catalog_activo = pd.DataFrame()
+                    # Solo opciones abiertas en cartera; lista A-Z por ticker/nombre
+                    catalog_activo = catalog_opciones_abiertas_ordenadas(catalog, _pos_nueva_op_acc)
                     position_type = "putOption"
                 elif tipo_registro == "Fondos":
                     position_type_base = "fund"
@@ -6416,7 +6456,12 @@ def main() -> None:
                         if catalog_activo.empty and tipo_registro == "Otros":
                             st.info("No hay posiciones de Otros en cartera. Elige «posición nueva» para registrar tu primera operación.")
                         if catalog_activo.empty and tipo_registro == "Opciones (Put/Call)":
-                            st.info("No hay opciones en cartera. Elige «posición nueva» para registrar la primera.")
+                            st.info(
+                                "No hay opciones abiertas en cartera. "
+                                "Elige «posición nueva» para abrir un contrato, o registra el cierre cuando aún haya posición."
+                            )
+                        elif tipo_registro == "Opciones (Put/Call)":
+                            st.caption("Solo opciones abiertas (pendientes de cierre), ordenadas A–Z.")
                         if not catalog_activo.empty:
                             for idx, (_, r) in enumerate(catalog_activo.iterrows()):
                                 lab = f"{r['ticker']} | {r['name']} ({r.get('positionCurrency', 'EUR')})"
