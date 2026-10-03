@@ -67,7 +67,7 @@ from filios_core.isin import (
 )
 
 # Versión visible en PC y add-on. Al publicar el add-on, actualizar también cartera_final/config.yaml.
-APP_VERSION = "1.0.36"
+APP_VERSION = "1.0.37"
 
 
 
@@ -6324,7 +6324,12 @@ def main() -> None:
                 )
                 if tipo_registro == "Acciones/ETFs":
                     position_type_base = "stock"
-                    catalog_activo = catalog
+                    # Sin puts/calls ni warrants (van en Opciones / Otros)
+                    if catalog is not None and not catalog.empty and "positionType" in catalog.columns:
+                        _pt_acc = catalog["positionType"].astype(str).str.strip().str.lower()
+                        catalog_activo = catalog[_pt_acc.isin(["stock", "etf", ""])].copy()
+                    else:
+                        catalog_activo = catalog.copy() if catalog is not None else pd.DataFrame()
                     tipo_nuevo = st.selectbox("Tipo de activo", ["Acción", "ETF"], key="new_tipo")
                     position_type = "stock" if tipo_nuevo == "Acción" else "etf"
                 elif tipo_registro == "Opciones (Put/Call)":
@@ -6379,9 +6384,6 @@ def main() -> None:
                     catalog_activo = catalog_opciones_abiertas_ordenadas(
                         catalog, _pos_nueva_op_acc, op_type=op_type
                     )
-                if tipo_registro == "Acciones/ETFs" and op_type in ("putAssignment", "callAssignment") and not catalog_activo.empty and "positionType" in catalog_activo.columns:
-                    _pt = catalog_activo["positionType"].astype(str).str.strip().str.lower()
-                    catalog_activo = catalog_activo[_pt.isin(["stock", "etf"])].copy()
                 op_description = st.text_area(
                     "Observación (opcional)",
                     key="op_description_nuevo",
