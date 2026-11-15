@@ -68,7 +68,7 @@ from filios_core.isin import (
 )
 
 # Versión visible en PC y add-on. Al publicar el add-on, actualizar también cartera_final/config.yaml.
-APP_VERSION = "1.0.39"
+APP_VERSION = "1.0.40"
 
 
 
@@ -1669,6 +1669,37 @@ def _normalize_time_to_24h(time_str: str) -> str:
     elif is_am and h == 12:
         h = 0
     return f"{h:02d}:{mm}:{ss}"
+
+
+def create_sqlite_backup_bytes() -> tuple[bytes | None, str]:
+    """
+    Copia consistente de la BD SQLite (sqlite backup API) para descargar desde la UI.
+    Devuelve (bytes, nombre_archivo) o (None, mensaje_error).
+    """
+    src = Path(DB_PATH)
+    if not src.is_file():
+        return None, f"No existe la base de datos: {src.name}"
+    tmp_path: str | None = None
+    try:
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+            tmp_path = tmp.name
+        with sqlite3.connect(str(src)) as conn_src:
+            with sqlite3.connect(tmp_path) as conn_dst:
+                conn_src.backup(conn_dst)
+        data = Path(tmp_path).read_bytes()
+        stamp = datetime.now(_MADRID_TZ).strftime("%Y%m%d_%H%M")
+        name = f"cartera_backup_{stamp}.db"
+        return data, name
+    except Exception as e:
+        return None, f"No se pudo crear el backup: {e}"
+    finally:
+        if tmp_path:
+            try:
+                Path(tmp_path).unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 def export_to_csv() -> bool:
@@ -6262,44 +6293,31 @@ def main() -> None:
 
     with st.sidebar.expander("Mantenimiento"):
         st.caption(
-            "Los datos se guardan en la base SQLite (acciones.db). Exporta a CSV para respaldo; "
-            "no abras los CSV con Excel si no quieres corromper el formato."
+            f"Fuente de verdad: base SQLite (`{Path(DB_PATH).name}`). "
+            "El backup descarga una copia completa (movimientos, dividendos, catálogo, etc.). "
+            "Guárdala fuera del servidor; para restaurar, sustituye el fichero `.db` en la carpeta de datos "
+            "(o pide restaurar desde la UI más adelante)."
         )
-        st.caption("**Acciones / ETFs:**")
-        if st.button("Exportar acciones a CSV (respaldo)"):
-            if export_to_csv():
-                st.success("Exportado a acciones.csv. Recargando…")
-                st.rerun()
+        st.caption("**Backup:**")
+        if st.button("Crear backup de la base de datos", key="btn_prep_db_backup", type="primary"):
+            blob, name_or_err = create_sqlite_backup_bytes()
+            if blob is None:
+                st.session_state.pop("_db_backup_blob", None)
+                st.session_state.pop("_db_backup_name", None)
+                st.error(name_or_err)
             else:
-                st.error("No se pudo exportar.")
-        if st.button("Restaurar acciones desde acciones.csv"):
-            ok, msg = restore_movimientos_from_csv()
-            if ok:
-                st.success(msg)
-                st.rerun()
-            else:
-                st.error(msg)
-        st.caption("**Fondos:**")
-        if st.button("Exportar fondos a CSV (respaldo)"):
-            if export_fondos_to_csv():
-                st.success("Exportado a fondos.csv. Recargando…")
-                st.rerun()
-            else:
-                st.error("No se pudo exportar fondos.")
-        if st.button("Restaurar fondos desde fondos.csv"):
-            ok, msg = restore_fondos_from_csv()
-            if ok:
-                st.success(msg)
-                st.rerun()
-            else:
-                st.error(msg)
-        st.caption("**Criptos:**")
-        if st.button("Exportar criptos a movimientos_criptos.csv (respaldo)"):
-            if export_criptos_to_csv():
-                st.success("Exportado a movimientos_criptos.csv. Recargando…")
-                st.rerun()
-            else:
-                st.error("No se pudo exportar criptos.")
+                st.session_state["_db_backup_blob"] = blob
+                st.session_state["_db_backup_name"] = name_or_err
+                st.success(f"Backup listo: {name_or_err} ({len(blob):,} bytes). Descárgalo abajo.")
+        if st.session_state.get("_db_backup_blob"):
+            st.download_button(
+                "Descargar backup (.db)",
+                data=st.session_state["_db_backup_blob"],
+                file_name=str(st.session_state.get("_db_backup_name") or "cartera_backup.db"),
+                mime="application/octet-stream",
+                key="btn_dl_db_backup",
+                help="Copia el archivo a un sitio seguro (PC, nube). No lo abras con Excel.",
+            )
         st.caption("**Totales:**")
         if st.button("📐 Recalcular totales", key="btn_recalc_totals", help="Recalcula total, totalBaseCurrency, totalWithComission y totalWithComissionBaseCurrency para todos los movimientos (acciones, fondos, criptos). No actualiza si detecta anomalías."):
             n, msg = recalc_all_totals()
