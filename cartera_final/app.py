@@ -23,6 +23,7 @@ from filios_core.config import (
     DATA_DIR as _DATA_DIR,
     DB_PATH,
     DIVIDENDOS_CSV_PATH,
+    EMPRESA_ALIAS_PATH,
     FONDOS_CSV_PATH,
     MOVIMIENTOS_CRIPTOS_CSV_PATH,
     PRECIOS_MANUALES_PATH,
@@ -67,7 +68,7 @@ from filios_core.isin import (
 )
 
 # Versión visible en PC y add-on. Al publicar el add-on, actualizar también cartera_final/config.yaml.
-APP_VERSION = "1.0.37"
+APP_VERSION = "1.0.39"
 
 
 
@@ -3581,31 +3582,104 @@ def _distribucion_agregar_acciones_etf_fondos_mismo_broker_ticker(enr: pd.DataFr
 
 
 _NOMBRE_CLAVE_SUFFIX_RE = re.compile(
-    r"\s*,?\s*(inc\.?|incorporated|corp\.?|corporation|ltd\.?|limited|plc|s\.?a\.?|n\.?v\.?)\s*$",
+    r"\s*,?\s*(inc\.?|incorporated|corp\.?|corporation|ltd\.?|limited|plc|s\.?a\.?|n\.?v\.?|holdings?)\s*$",
     re.IGNORECASE,
 )
+
+# Sufijos de listing en el nombre: "Tencent $", "Tencent (Hkd)", "BYD (Hkd)", "CSL $ (Aud)"
+_EMPRESA_LISTING_MARK_RE = re.compile(
+    r"""\s*(
+        \$\s*$|
+        \(\s*(hkd|hk|usd|eur|aud|gbp|chf|jpy|sgd|cny)\s*\)\s*$|
+        \$\s*\(\s*(hkd|hk|usd|eur|aud|gbp|chf|jpy|sgd|cny)\s*\)\s*$
+    )""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+@lru_cache(maxsize=1)
+def _empresa_alias_maps() -> tuple[dict[str, str], dict[str, str]]:
+    """
+    Alias opcionales desde DATA_DIR/empresa_alias.json (solo presentación).
+    {
+      "by_yahoo": {"TCEHY": "tencent", "0700.HK": "tencent"},
+      "by_isin": {"US88032Q1094": "tencent"},
+      "labels": {"tencent": "Tencent"}
+    }
+    """
+    by_key: dict[str, str] = {}
+    labels: dict[str, str] = {}
+    path = Path(EMPRESA_ALIAS_PATH)
+    if not path.is_file():
+        return by_key, labels
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return by_key, labels
+    if not isinstance(raw, dict):
+        return by_key, labels
+    for section in ("by_yahoo", "by_isin"):
+        block = raw.get(section) or {}
+        if isinstance(block, dict):
+            for k, v in block.items():
+                kk = str(k or "").strip().casefold()
+                vv = str(v or "").strip().casefold()
+                if kk and vv:
+                    by_key[kk] = vv
+    lab = raw.get("labels") or {}
+    if isinstance(lab, dict):
+        for k, v in lab.items():
+            kk = str(k or "").strip().casefold()
+            vv = str(v or "").strip()
+            if kk and vv:
+                labels[kk] = vv
+    return by_key, labels
+
+
+def _empresa_nombre_nucleo(nombre: str) -> str:
+    """Núcleo de empresa quitando listing ($/(Hkd)/…) y sufijos societarios."""
+    s = " ".join(str(nombre or "").split()).strip()
+    if not s:
+        return ""
+    for _ in range(6):
+        s2 = _EMPRESA_LISTING_MARK_RE.sub("", s).strip()
+        s2 = _NOMBRE_CLAVE_SUFFIX_RE.sub("", s2).strip()
+        s2 = " ".join(s2.split()).strip(" ,.-")
+        if s2 == s:
+            break
+        s = s2
+    return s.casefold() if s else ""
+
+
+def _empresa_etiqueta_desde_nombre(nombre: str) -> str:
+    """Etiqueta legible a partir del nombre (sin marcas de listing)."""
+    s = " ".join(str(nombre or "").split()).strip()
+    if not s:
+        return ""
+    for _ in range(6):
+        s2 = _EMPRESA_LISTING_MARK_RE.sub("", s).strip()
+        s2 = " ".join(s2.split()).strip(" ,.-")
+        if s2 == s:
+            break
+        s = s2
+    return s or str(nombre or "").strip()
 
 
 def _distribucion_nombre_clave_posicion(row: pd.Series) -> str:
     """Clave estable para agrupar la misma empresa en Distribución (nombre o ticker)."""
     n = str(row.get("Nombre") or "").strip()
     if n:
-        s = " ".join(n.split()).casefold()
-        s = _NOMBRE_CLAVE_SUFFIX_RE.sub("", s).strip()
-        return s if s else "__"
+        nucleo = _empresa_nombre_nucleo(n)
+        return nucleo if nucleo else "__"
     ty = str(row.get("Ticker_Yahoo") or row.get("Ticker") or "").strip()
     return ty.casefold() if ty else "__"
 
 
-def _distribucion_fila_clave_agrupacion(row: pd.Series, cat_cache: dict[str, str]) -> str:
-    """
-    Prioridad: ISIN en la fila → ISIN en instrument_catalog (ticker Yahoo / ticker) → nombre normalizado.
-    Prefijos evitan colisión ISIN vs texto accidental.
-    """
+def _empresa_fila_resuelve_isin(row: pd.Series, cat_cache: dict[str, str]) -> str:
     for c in ("isin", "ISIN"):
         ni = _norm_isin_field(row.get(c))
         if ni:
-            return f"ISIN:{ni}"
+            return ni
     ty = str(row.get("Ticker_Yahoo") or "").strip()
     to = str(row.get("Ticker") or "").strip()
     for cand in (ty, to):
@@ -3615,14 +3689,59 @@ def _distribucion_fila_clave_agrupacion(row: pd.Series, cat_cache: dict[str, str
             cat_cache[cand] = _lookup_isin_for_ticker_yahoo(cand) or ""
         ni = _norm_isin_field(cat_cache[cand])
         if ni:
-            return f"ISIN:{ni}"
-    return f"NOM:{_distribucion_nombre_clave_posicion(row)}"
+            return ni
+    return ""
+
+
+def _empresa_clave_agrupacion(row: pd.Series, cat_cache: dict[str, str]) -> str:
+    """
+    Clave de presentación «empresa» (Cartera / Análisis). No afecta FIFO.
+    Prioridad: alias explícito → núcleo de nombre (Tencent $/Hkd) → ISIN → Yahoo.
+    """
+    by_key, _labels = _empresa_alias_maps()
+    ty = str(row.get("Ticker_Yahoo") or "").strip()
+    to = str(row.get("Ticker") or "").strip()
+    for cand in (ty, to):
+        if cand and cand.casefold() in by_key:
+            return f"EMP:{by_key[cand.casefold()]}"
+    isin = _empresa_fila_resuelve_isin(row, cat_cache)
+    if isin and isin.casefold() in by_key:
+        return f"EMP:{by_key[isin.casefold()]}"
+    nucleo = _distribucion_nombre_clave_posicion(row)
+    if nucleo and nucleo != "__":
+        return f"NOM:{nucleo}"
+    if isin:
+        return f"ISIN:{isin}"
+    y = (ty or to).strip()
+    return f"YH:{y.casefold()}" if y else "YH:__"
+
+
+def _empresa_etiqueta_grupo(part: pd.DataFrame, group_key: str) -> str:
+    """Nombre visible del grupo empresa."""
+    _by, labels = _empresa_alias_maps()
+    if group_key.startswith("EMP:"):
+        eid = group_key[4:]
+        if eid in labels:
+            return labels[eid]
+    names = [str(x).strip() for x in part.get("Nombre", pd.Series(dtype=str)).tolist() if str(x).strip()]
+    if names:
+        cleaned = [_empresa_etiqueta_desde_nombre(n) for n in names]
+        cleaned = [c for c in cleaned if c]
+        if cleaned:
+            return min(cleaned, key=len)
+    ty = str(part.iloc[0].get("Ticker_Yahoo") or part.iloc[0].get("Ticker") or "").strip()
+    return ty or "—"
+
+
+def _distribucion_fila_clave_agrupacion(row: pd.Series, cat_cache: dict[str, str]) -> str:
+    """Agrupación Distribución: misma clave «empresa» (alias / nombre / ISIN)."""
+    return _empresa_clave_agrupacion(row, cat_cache)
 
 
 def _distribucion_agregar_acciones_etf_fondos_mismo_isin_o_nombre(enr: pd.DataFrame) -> pd.DataFrame:
     """
-    Colapsa filas por ISIN (movimiento o catálogo) y clase; si no hay ISIN, por nombre normalizado
-    (misma lógica que antes). Así se unen brokers/listings del mismo valor negociable.
+    Colapsa filas por empresa (alias, núcleo de nombre o ISIN) y clase.
+    Une ADR+HK (Tencent) y dual listing mismo ISIN (BYD). Solo presentación.
     """
     if enr.empty or "_Grupo" not in enr.columns:
         return enr
@@ -3635,7 +3754,7 @@ def _distribucion_agregar_acciones_etf_fondos_mismo_isin_o_nombre(enr: pd.DataFr
     sub["_gk"] = sub.apply(lambda r: _distribucion_fila_clave_agrupacion(r, cat_cache), axis=1)
     sub["_vm"] = pd.to_numeric(sub["Valor Mercado €"], errors="coerce").fillna(0.0)
     pieces: list[pd.Series] = []
-    for (_, _), part in sub.groupby(["_gk", "_Grupo"], sort=False):
+    for (gk, _), part in sub.groupby(["_gk", "_Grupo"], sort=False):
         part = part.reset_index(drop=True)
         vm = part["_vm"]
         idx_max = int(vm.idxmax()) if len(vm) else 0
@@ -3644,8 +3763,14 @@ def _distribucion_agregar_acciones_etf_fondos_mismo_isin_o_nombre(enr: pd.DataFr
         row["Inversion €"] = float(pd.to_numeric(part["Inversion €"], errors="coerce").fillna(0.0).sum())
         if "Div_EUR" in part.columns:
             row["Div_EUR"] = float(pd.to_numeric(part["Div_EUR"], errors="coerce").fillna(0.0).sum())
+        # Títulos: solo si un listing; si hay varios no sumar (ADR ≠ HK)
         if "Titulos" in part.columns:
-            row["Titulos"] = float(pd.to_numeric(part["Titulos"], errors="coerce").fillna(0.0).sum())
+            if len(part) == 1:
+                row["Titulos"] = float(pd.to_numeric(part["Titulos"], errors="coerce").fillna(0.0).sum())
+            else:
+                row["Titulos"] = math.nan
+        if "Nombre" in row.index:
+            row["Nombre"] = _empresa_etiqueta_grupo(part, str(gk))
         if "Plusvalia €" in row.index:
             row["Plusvalia €"] = float(row["Valor Mercado €"]) - float(row["Inversion €"] or 0)
         inv = float(row.get("Inversion €") or 0)
@@ -4502,9 +4627,9 @@ def render_analisis_distribucion(df_acciones: pd.DataFrame) -> None:
         "Las **cotizaciones** son las mismas que en Cartera (un solo «Actualizar» sirve para ambas vistas). "
         "Elige **Todos** o una clase (acciones, ETF, cripto, fondos). **G/P %** = plusvalía / valor de mercado. "
         "Dividendos: suma de **totalBaseCurrency** (€) por cuenta y ticker Yahoo. "
-        "**Cripto:** una fila por moneda (suma de cuentas). **Acciones / ETFs / fondos:** primero por ticker+cuenta; "
-        "luego se agrupan por **ISIN** (columna del movimiento o catálogo de instrumentos) y clase; sin ISIN, por **nombre** "
-        "normalizado. Conviene tener el ISIN bien cargado en movimientos o en Catálogo."
+        "**Cripto:** una fila por moneda (suma de cuentas). **Acciones / ETFs / fondos:** se agrupan por **empresa** "
+        "(alias opcional, núcleo de nombre p. ej. Tencent $/Hkd, o ISIN si no hay nombre útil). "
+        "Solo afecta a esta vista; FIFO/fiscal no cambian. Alias opcionales: `empresa_alias.json` en la carpeta de datos."
     )
     positions_full, sig_full = _ensure_cartera_enriched_session(df_acciones)
     base = _distribucion_filtrar_lineas(positions_full.copy())
