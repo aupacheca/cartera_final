@@ -68,7 +68,7 @@ from filios_core.isin import (
 )
 
 # Versión visible en PC y add-on. Al publicar el add-on, actualizar también cartera_final/config.yaml.
-APP_VERSION = "1.0.40"
+APP_VERSION = "1.0.41"
 
 
 
@@ -4773,7 +4773,8 @@ def render_analisis_distribucion(df_acciones: pd.DataFrame) -> None:
             }
         ]
     )
-    tbl_disp = pd.concat([tbl, tot_row], ignore_index=True)
+    # TOTAL siempre arriba (Streamlit no fija filas al scroll; queda visible al abrir la tabla)
+    tbl_disp = pd.concat([tot_row, tbl], ignore_index=True)
 
     modo_graf = st.radio(
         "Gráficos (por posición y por tipo)",
@@ -4800,11 +4801,9 @@ def render_analisis_distribucion(df_acciones: pd.DataFrame) -> None:
         )
 
         def _gpcolor(s: pd.Series) -> list[str]:
-            return [
-                f"color: {_plusvalia_color_css(v)}; font-weight: 600" if i < len(s) - 1 else ""
-                for i, v in enumerate(s)
-            ]
+            return [f"color: {_plusvalia_color_css(v)}; font-weight: 600" for v in s]
 
+        sty = sty.apply(_distribucion_highlight_total_row, axis=1)
         sty = sty.apply(_gpcolor, subset=["G/P n/realiz (€)"], axis=0)
         sty = sty.apply(_gpcolor, subset=["G/P n/realiz (%)"], axis=0)
         st.dataframe(sty, use_container_width=True, hide_index=True)
@@ -4862,7 +4861,7 @@ def render_analisis_distribucion(df_acciones: pd.DataFrame) -> None:
             }
         ]
     )
-    tbl2_disp = pd.concat([tbl2, tot_row2], ignore_index=True)
+    tbl2_disp = pd.concat([tot_row2, tbl2], ignore_index=True)
 
     c3, c4 = st.columns([1.25, 1.0])
     with c3:
@@ -4879,6 +4878,7 @@ def render_analisis_distribucion(df_acciones: pd.DataFrame) -> None:
             },
             na_rep="–",
         )
+        sty2 = sty2.apply(_distribucion_highlight_total_row, axis=1)
         sty2 = sty2.apply(
             lambda s: [f"color: {_plusvalia_color_css(v)}; font-weight: 600" for v in s],
             subset=["G/P n/realiz (€)"],
@@ -4921,6 +4921,14 @@ def _plusvalia_color_css(value: float | None) -> str:
     if v < 0:
         return "#c62828"
     return "#9e9e9e"
+
+
+def _distribucion_highlight_total_row(row: pd.Series) -> list[str]:
+    """Resalta la fila TOTAL (primera) en tablas de Distribución."""
+    label = str(row.iloc[0] if len(row) else "").strip().upper()
+    if label == "TOTAL":
+        return ["background-color: rgba(100, 120, 150, 0.28); font-weight: 700"] * len(row)
+    return [""] * len(row)
 
 
 def _st_metric_colored(label: str, value_text: str, value_color_css: str) -> None:
